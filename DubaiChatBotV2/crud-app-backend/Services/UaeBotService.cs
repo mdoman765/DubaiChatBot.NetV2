@@ -22,6 +22,7 @@ namespace crud_app_backend.Bot.Services
         private readonly BotStateService _state;
         private readonly IHttpClientFactory _httpFactory;
         private readonly ILogger<UaeBotService> _logger;
+        private readonly IWhatsAppComplaintRepository _complaintRepo;
 
         public UaeBotService(
             IWhatsAppSessionService sessionSvc,
@@ -33,7 +34,8 @@ namespace crud_app_backend.Bot.Services
             IMemoryCache cache,
             BotStateService state,
             IHttpClientFactory httpFactory,
-            ILogger<UaeBotService> logger)
+            ILogger<UaeBotService> logger,
+            IWhatsAppComplaintRepository complaintRepo)
         {
             _sessionSvc = sessionSvc;
             _msgRepo = msgRepo;
@@ -45,6 +47,7 @@ namespace crud_app_backend.Bot.Services
             _state = state;
             _httpFactory = httpFactory;
             _logger = logger;
+            _complaintRepo = complaintRepo;
         }
 
 
@@ -58,6 +61,30 @@ namespace crud_app_backend.Bot.Services
 
                 _logger.LogInformation("[UAE] {Type} from {Phone} id={Id}",
                     msg.MsgType, msg.From, msg.MessageId);
+
+                // ★ NEW — universal media download for ANY state
+                if (msg.MsgType == "image" || msg.MsgType == "audio")
+                {
+                    var isAudio = msg.MsgType == "audio";
+                    var mediaId = isAudio ? msg.AudioId : msg.ImageId;
+                    var mime = isAudio ? msg.AudioMime : msg.ImageMime;
+                    var subFolder = isAudio ? "audio" : "images";
+                    var caption = isAudio ? null : msg.ImageCaption;
+
+                    var savedPath = await SaveMediaToDiskAsync(
+                        msg.MessageId, mediaId, mime,
+                        msg.From, msg.SenderName, msg.Timestamp,
+                        subFolder, caption);
+
+                    if (savedPath != null)
+                    {
+                        var baseUrl = (_config["App:BaseUrl"] ?? "http://localhost:8041").TrimEnd('/');
+                        var fileName = Path.GetFileName(savedPath);
+                        msg.SavedFileUrl = $"{baseUrl}/wa-media/{subFolder}/{fileName}";
+                        msg.SavedFilePath = savedPath;
+                        _logger.LogInformation("[UAE] Universal media saved → {Url}", msg.SavedFileUrl);
+                    }
+                }
 
                 var userLock = _state.UserLocks.GetOrAdd(msg.From, _ => new SemaphoreSlim(1, 1));
                 await userLock.WaitAsync();
@@ -73,14 +100,15 @@ namespace crud_app_backend.Bot.Services
 
                     if (string.IsNullOrWhiteSpace(reply))
                     {
-                        await PersistSessionAsync(session, msg.RawText);
+                        await PersistSessionAsync(session, msg.RawText, msg.SavedFileUrl);
+
                         return;
                     }
 
                     await Task.WhenAll(
-                        PersistSessionAsync(session, msg.RawText),
-                        _dialog.SendTextAsync(msg.From, reply)
-                    );
+     PersistSessionAsync(session, msg.RawText, msg.SavedFileUrl),
+     _dialog.SendTextAsync(msg.From, reply)
+ );
                 }
                 finally { userLock.Release(); }
             }
@@ -132,11 +160,11 @@ namespace crud_app_backend.Bot.Services
             if (s.State == "AWAITING_COMPLAINT_CONFIRM" && msg.RawText == "y")
                 return s.T("⏳ Submitting complaint...", "⏳ অভিযোগ জমা হচ্ছে...", "⏳ शिकायत जमा हो रही है...");
 
-            if (s.State == "AWAITING_RETURN_CONFIRM" && msg.RawText == "y" )
+            if (s.State == "AWAITING_RETURN_CONFIRM" && msg.RawText == "y")
                 return s.T("⏳ Submitting return request...", "⏳ রিটার্ন জমা হচ্ছে...", "⏳ वापसी जमा हो रही है...");
 
             if ((s.State == "AWAITING_AGENT_CONFIRM_1" || s.State == "AWAITING_AGENT_CONFIRM_2")
-                && (msg.RawText == "y" || msg.RawText == "1" ))
+                && (msg.RawText == "y" || msg.RawText == "1"))
                 return s.T("⏳ Connecting to agent...", "⏳ এজেন্টের সাথে সংযোগ...", "⏳ एजेंट से जोड़ा जा रहा है...");
 
             return null;
@@ -377,7 +405,7 @@ namespace crud_app_backend.Bot.Services
         private static string BuildMainMenuBody(string lang) => lang switch
         {
             "bn" =>
-               
+
                 "1️⃣  অর্ডার দিন\n" +
                 "2️⃣  রিটার্ন / রিপ্লেসমেন্ট\n" +
                 "3️⃣  অভিযোগ / ফিডব্যাক\n" +
@@ -385,7 +413,7 @@ namespace crud_app_backend.Bot.Services
                 "0️⃣  ভাষা পরিবর্তন\n\n" +
                 "👉 *1*, *2*, *3*, *4* বা *0* পাঠান।",
             "hi" =>
-               
+
                 "1️⃣  ऑर्डर करें\n" +
                 "2️⃣  वापसी / प्रतिस्थापन\n" +
                 "3️⃣  शिकायत / फ़ीडबैक\n" +
@@ -393,7 +421,7 @@ namespace crud_app_backend.Bot.Services
                 "0️⃣  भाषा बदलें\n\n" +
                 "👉 *1*, *2*, *3*, *4* या *0* भेजें।",
             _ =>
-                
+
                 "1️⃣  Place Order\n" +
                 "2️⃣  Return / Replacement\n" +
                 "3️⃣  Complaint / Feedback\n" +
@@ -454,6 +482,23 @@ namespace crud_app_backend.Bot.Services
             };
 
             var result = await _crm.SubmitAsync(req);
+
+            // ── Persist ticket to local DB ────────────────────────────────────
+            await _complaintRepo.AddAsync(new crud_app_backend.Models.WhatsAppComplaint
+            {
+                Phone           = s.Phone,
+                ShopCode        = req.ShopCode,
+                ShopName        = s.ShopName,
+                TicketType      = req.TicketType,
+                TicketCategory  = "UAE_Chatbot",
+                Description     = req.Description,
+                CartItems       = req.CartItems,
+                Status          = result.Success ? "SUCCESS" : "FAILED",
+                ExternalTicketId = result.TicketId,
+                CreatedAt       = DateTime.UtcNow,
+                UpdatedAt       = DateTime.UtcNow,
+            });
+
             Transition(s, "MAIN_MENU");
 
             return result.Success
@@ -569,7 +614,16 @@ namespace crud_app_backend.Bot.Services
                     msg.From, msg.SenderName, msg.Timestamp, "images",
                     caption: msg.ImageCaption);
                 if (imageId != null)
+                {
                     s.MediaImages.Add(imageId);
+                    // Capture URL for WhatsAppSessionHistory.RawMessage.
+                    // If the universal block already set it, keep it; otherwise build from disk path.
+                    if (string.IsNullOrWhiteSpace(msg.SavedFileUrl))
+                    {
+                        var baseUrl2 = (_config["App:BaseUrl"] ?? "http://localhost:8041").TrimEnd('/');
+                        msg.SavedFileUrl = $"{baseUrl2}/wa-media/images/{Path.GetFileName(imageId)}";
+                    }
+                }
                 else
                     return s.T(
                         "⚠️ Image could not be uploaded. Please try again.",
@@ -596,7 +650,15 @@ namespace crud_app_backend.Bot.Services
                     msg.MessageId, msg.AudioId, msg.AudioMime,
                     msg.From, msg.SenderName, msg.Timestamp, "audio");
                 if (voiceId != null)
+                {
                     s.MediaVoices.Add(voiceId);
+                    // Same as image — ensure SavedFileUrl is set for RawMessage.
+                    if (string.IsNullOrWhiteSpace(msg.SavedFileUrl))
+                    {
+                        var baseUrl2 = (_config["App:BaseUrl"] ?? "http://localhost:8041").TrimEnd('/');
+                        msg.SavedFileUrl = $"{baseUrl2}/wa-media/audio/{Path.GetFileName(voiceId)}";
+                    }
+                }
                 else
                     return s.T(
                         "⚠️ Voice note could not be uploaded. Please try again.",
@@ -640,6 +702,23 @@ namespace crud_app_backend.Bot.Services
             };
 
             var result = await _crm.SubmitAsync(req);
+
+            // ── Persist ticket to local DB ────────────────────────────────────
+            await _complaintRepo.AddAsync(new crud_app_backend.Models.WhatsAppComplaint
+            {
+                Phone           = s.Phone,
+                ShopCode        = req.ShopCode,
+                ShopName        = s.ShopName,
+                TicketType      = req.TicketType,
+                TicketCategory  = "UAE_Chatbot",
+                Description     = req.Description,
+                CartItems       = req.CartItems,
+                Status          = result.Success ? "SUCCESS" : "FAILED",
+                ExternalTicketId = result.TicketId,
+                CreatedAt       = DateTime.UtcNow,
+                UpdatedAt       = DateTime.UtcNow,
+            });
+
             ClearMedia(s);
             Transition(s, "MAIN_MENU");
 
@@ -662,12 +741,12 @@ namespace crud_app_backend.Bot.Services
                 $"✅ *{ticketLabel} জমা হয়েছে*\n\n" +
                 (result.TicketId != null ? $"টিকেট আইডি : *{result.TicketId}*\n\n" : "") +
                 "আমাদের টিম শীঘ্রই যোগাযোগ করবে।\n\n" +
-                "👉 *menu* — মূল মেনু\n" ,
+                "👉 *menu* — মূল মেনু\n",
 
                 $"✅ *{ticketLabel} जमा हुआ*\n\n" +
                 (result.TicketId != null ? $"टिकट ID : *{result.TicketId}*\n\n" : "") +
                 "हमारी टीम जल्द संपर्क करेगी।\n\n" +
-                "👉 *menu* — मुख्य मेनू\n" );
+                "👉 *menu* — मुख्य मेनू\n");
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -719,6 +798,23 @@ namespace crud_app_backend.Bot.Services
             };
 
             var result = await _crm.SubmitAsync(req);
+
+            // ── Persist ticket to local DB ────────────────────────────────────
+            await _complaintRepo.AddAsync(new crud_app_backend.Models.WhatsAppComplaint
+            {
+                Phone           = s.Phone,
+                ShopCode        = req.ShopCode,
+                ShopName        = s.ShopName,
+                TicketType      = req.TicketType,
+                TicketCategory  = "UAE_Chatbot",
+                Description     = req.Description,
+                CartItems       = req.CartItems,
+                Status          = result.Success ? "SUCCESS" : "FAILED",
+                ExternalTicketId = result.TicketId,
+                CreatedAt       = DateTime.UtcNow,
+                UpdatedAt       = DateTime.UtcNow,
+            });
+
             Transition(s, "MAIN_MENU");
 
             return result.Success
@@ -795,7 +891,7 @@ namespace crud_app_backend.Bot.Services
                 await File.WriteAllBytesAsync(filePath, bytes);
                 _logger.LogInformation("[UAE] Saved to {Path}", filePath);
 
-                var baseUrl = _config["App:BaseUrl"] ?? "https://webhook.prangroup.com";
+                var baseUrl = _config["App:BaseUrl"] ?? "http://localhost:8041";
                 var fileUrl = $"{baseUrl}/wa-media/{subFolder}/{fileName}";
                 try
                 {
@@ -867,8 +963,9 @@ namespace crud_app_backend.Bot.Services
             return session;
         }
 
-        private async Task PersistSessionAsync(UaeSession s, string rawText)
+        private async Task PersistSessionAsync(UaeSession s, string rawText, string? fileUrl = null)
         {
+
             _cache.Set($"uae:{s.Phone}", s,
                 new MemoryCacheEntryOptions().SetSlidingExpiration(TimeSpan.FromMinutes(60)));
             try
@@ -879,7 +976,11 @@ namespace crud_app_backend.Bot.Services
                     CurrentStep = s.State,
                     PreviousStep = s.PreviousState,
                     TempData = s.Save(),
-                    RawMessage = rawText,
+                    // RawMessage: for media messages rawText="" and fileUrl=public URL.
+                    // For text messages fileUrl=null and rawText=message body.
+                    RawMessage = !string.IsNullOrWhiteSpace(fileUrl)
+                        ? (string.IsNullOrWhiteSpace(rawText) ? fileUrl : $"{rawText} | {fileUrl}")
+                        : rawText,
                 });
                 _logger.LogInformation("[UAE] PersistSession OK phone={Phone} step={Step}", s.Phone, s.State);
             }
@@ -890,7 +991,7 @@ namespace crud_app_backend.Bot.Services
             }
         }
 
-     
+
 
         private static void Transition(UaeSession s, string newState)
         {
@@ -958,6 +1059,9 @@ namespace crud_app_backend.Bot.Services
         public string ImageId { get; set; } = "";
         public string ImageMime { get; set; } = "image/jpeg";
         public string ImageCaption { get; set; } = "";
+        public string? SavedFileUrl { get; set; }
+        public string? SavedFilePath { get; set; }  // disk path set after successful save
+
     }
 
     public static class UaeMessageParser

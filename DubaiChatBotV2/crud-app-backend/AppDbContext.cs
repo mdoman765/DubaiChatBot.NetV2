@@ -11,8 +11,7 @@ namespace crud_app_backend
         public DbSet<WhatsAppSession> WhatsAppSessions { get; set; } = null!;
         public DbSet<WhatsAppSessionHistory> WhatsAppSessionHistories { get; set; } = null!;
         public DbSet<WhatsAppMessage> WhatsAppMessages { get; set; } = null!;
-     //   public DbSet<WhatsAppComplaint> WhatsAppComplaints { get; set; } = null!;
-      //  public DbSet<WhatsAppComplaintMedia> WhatsAppComplaintMedia { get; set; } = null!;
+        public DbSet<WhatsAppComplaint> WhatsAppComplaints { get; set; } = null!;
 
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
@@ -70,41 +69,24 @@ namespace crud_app_backend
             });
 
             // ── dbo.WhatsAppComplaints ────────────────────────────────────────
-            //modelBuilder.Entity<WhatsAppComplaint>(entity =>
-            //{
-            //    entity.ToTable("WhatsAppComplaints", "dbo");
-            //    entity.HasKey(e => e.Id);
-            //    entity.Property(e => e.Phone).HasMaxLength(30);
-            //    entity.Property(e => e.ShopCode).HasMaxLength(50);
-            //    entity.Property(e => e.ShopName).HasMaxLength(255);
-            //    entity.Property(e => e.TicketType).HasMaxLength(50);
-            //    entity.Property(e => e.TicketCategory).HasMaxLength(50);
-            //    entity.Property(e => e.Description).HasColumnType("nvarchar(max)");
-            //    entity.Property(e => e.CartItems).HasColumnType("nvarchar(max)");
-            //    entity.Property(e => e.Status).HasMaxLength(50).HasDefaultValue("PENDING");
-            //    entity.Property(e => e.ExternalTicketId).HasMaxLength(30);
-            //    entity.HasMany(e => e.Media)
-            //          .WithOne()
-            //          .HasForeignKey(m => m.ComplaintId)
-            //          .HasConstraintName("FK_ComplaintMedia_ComplaintId")
-            //          .OnDelete(DeleteBehavior.Cascade);
-            //    entity.HasIndex(e => new { e.Phone, e.CreatedAt })
-            //          .HasDatabaseName("IX_WhatsAppComplaints_Phone");
-            //    entity.HasIndex(e => e.TicketType)
-            //          .HasDatabaseName("IX_WhatsAppComplaints_TicketType");
-            //});
-
-            //// ── dbo.WhatsAppComplaintMedia ────────────────────────────────────
-            //modelBuilder.Entity<WhatsAppComplaintMedia>(entity =>
-            //{
-            //    entity.ToTable("WhatsAppComplaintMedia", "dbo");
-            //    entity.HasKey(e => e.Id);
-            //    entity.Property(e => e.MediaType).HasMaxLength(20);
-            //    entity.Property(e => e.FileUrl).HasMaxLength(2048);
-            //    entity.Property(e => e.FileName).HasMaxLength(255);
-            //    entity.HasIndex(e => e.ComplaintId)
-            //          .HasDatabaseName("IX_WhatsAppComplaintMedia_ComplaintId");
-            //});
+            modelBuilder.Entity<WhatsAppComplaint>(entity =>
+            {
+                entity.ToTable("WhatsAppComplaints", "dbo");
+                entity.HasKey(e => e.Id);
+                entity.Property(e => e.Phone).HasMaxLength(30);
+                entity.Property(e => e.ShopCode).HasMaxLength(50);
+                entity.Property(e => e.ShopName).HasMaxLength(255);
+                entity.Property(e => e.TicketType).HasMaxLength(50);
+                entity.Property(e => e.TicketCategory).HasMaxLength(50);
+                entity.Property(e => e.Description).HasColumnType("nvarchar(max)");
+                entity.Property(e => e.CartItems).HasColumnType("nvarchar(max)");
+                entity.Property(e => e.Status).HasMaxLength(50).HasDefaultValue("PENDING");
+                entity.Property(e => e.ExternalTicketId).HasMaxLength(30);
+                entity.HasIndex(e => new { e.Phone, e.CreatedAt })
+                      .HasDatabaseName("IX_WhatsAppComplaints_Phone");
+                entity.HasIndex(e => e.TicketType)
+                      .HasDatabaseName("IX_WhatsAppComplaints_TicketType");
+            });
         }
     }
 }

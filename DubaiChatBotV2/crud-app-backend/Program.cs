@@ -18,6 +18,7 @@ builder.Services.AddDbContextPool<AppDbContext>(options =>
 // ── Repositories (only what UAE bot needs) ────────────────────────────────────
 builder.Services.AddScoped<IWhatsAppSessionRepository, WhatsAppSessionRepository>();
 builder.Services.AddScoped<IWhatsAppMessageRepository, WhatsAppMessageRepository>();
+builder.Services.AddScoped<IWhatsAppComplaintRepository, WhatsAppComplaintRepository>();
 
 // ── Session service ───────────────────────────────────────────────────────────
 builder.Services.AddScoped<IWhatsAppSessionService, WhatsAppSessionService>();
