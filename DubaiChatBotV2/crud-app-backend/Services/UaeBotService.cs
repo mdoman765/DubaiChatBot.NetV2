@@ -24,6 +24,10 @@ namespace crud_app_backend.Bot.Services
         private readonly ILogger<UaeBotService> _logger;
         private readonly IWhatsAppComplaintRepository _complaintRepo;
 
+        // ── Website base URL (cont_id=3 for UAE) ─────────────────────────────
+        private const string WebsiteBaseUrl = "https://myorder.prangroup.com";
+        private const string WebsiteContId = "3";
+
         public UaeBotService(
             IWhatsAppSessionService sessionSvc,
             IWhatsAppMessageRepository msgRepo,
@@ -62,7 +66,7 @@ namespace crud_app_backend.Bot.Services
                 _logger.LogInformation("[UAE] {Type} from {Phone} id={Id}",
                     msg.MsgType, msg.From, msg.MessageId);
 
-                // ★ NEW — universal media download for ANY state
+                // ★ Universal media download for ANY state
                 if (msg.MsgType == "image" || msg.MsgType == "audio")
                 {
                     var isAudio = msg.MsgType == "audio";
@@ -101,14 +105,13 @@ namespace crud_app_backend.Bot.Services
                     if (string.IsNullOrWhiteSpace(reply))
                     {
                         await PersistSessionAsync(session, msg.RawText, msg.SavedFileUrl);
-
                         return;
                     }
 
                     await Task.WhenAll(
-     PersistSessionAsync(session, msg.RawText, msg.SavedFileUrl),
-     _dialog.SendTextAsync(msg.From, reply)
- );
+                        PersistSessionAsync(session, msg.RawText, msg.SavedFileUrl),
+                        _dialog.SendTextAsync(msg.From, reply)
+                    );
                 }
                 finally { userLock.Release(); }
             }
@@ -133,23 +136,17 @@ namespace crud_app_backend.Bot.Services
                 return s.T("⏳ Loading products...", "⏳ পণ্য লোড হচ্ছে...", "⏳ उत्पाद लोड हो रहे हैं...");
 
             // ── Gallery burst suppression for ACK ──────────────────────────────
-            // WhatsApp fires one webhook per image when user sends from gallery.
-            // SemaphoreSlim ensures sequential processing per user.
-            // "ack:{phone}" key — only ONE "⏳ Uploading media..." per batch (5s window).
             if ((s.State == "AWAITING_RETURN_DETAILS" || s.State == "AWAITING_COMPLAINT_DETAILS"
                  || s.State == "AWAITING_RETURN_CONFIRM" || s.State == "AWAITING_COMPLAINT_CONFIRM")
                 && (msg.MsgType == "image" || msg.MsgType == "audio"))
             {
-                // Use WA timestamp — not DateTime.UtcNow.
-                // By the time image 3 is processed, UtcNow may have drifted past the window.
-                // WA timestamps all gallery images within 1-2 seconds of each other.
                 var ackNow = msg.Timestamp > 0
                     ? DateTimeOffset.FromUnixTimeSeconds(msg.Timestamp).UtcDateTime
                     : DateTime.UtcNow;
                 var ackKey = $"ack:{s.Phone}";
                 if (_state.LastImageTime.TryGetValue(ackKey, out var lastAck)
                     && Math.Abs((ackNow - lastAck).TotalSeconds) <= 5)
-                    return null; // suppress — ACK already sent for this batch
+                    return null;
                 _state.LastImageTime[ackKey] = ackNow;
                 return s.T("⏳ Uploading media...", "⏳ মিডিয়া আপলোড হচ্ছে...", "⏳ मीडिया अपलोड हो रहा है...");
             }
@@ -183,8 +180,7 @@ namespace crud_app_backend.Bot.Services
                 new[] { "hi", "hello", "start", "hey", "new" }.Contains(raw))
             {
                 ResetSession(s);
-                Transition(s, "AWAITING_LANG"); // MUST transition — ResetSession sets INIT
-                                                // without this, next message sees INIT again
+                Transition(s, "AWAITING_LANG");
                 await SendWelcomeAsync(msg.From);
                 return string.Empty;
             }
@@ -214,6 +210,12 @@ namespace crud_app_backend.Bot.Services
                 "AWAITING_LANG" => await HandleLangAsync(s, msg),
                 "AWAITING_SHOP_CODE" => await HandleShopCodeAsync(s, msg),
                 "MAIN_MENU" => await HandleMainMenu(s, msg),
+
+                // ── NEW: method-selection states ─────────────────────────────
+                "AWAITING_ORDER_METHOD" => await HandleOrderMethodAsync(s, msg),
+                "AWAITING_RETURN_METHOD" => await HandleReturnMethodAsync(s, msg),
+                // ─────────────────────────────────────────────────────────────
+
                 "AWAITING_ORDER_CONFIRM" => await HandleOrderConfirmAsync(s, msg),
                 "AWAITING_RETURN_DETAILS" => await HandleMediaDetailsAsync(s, msg, "return"),
                 "AWAITING_RETURN_CONFIRM" => await HandleReturnConfirmAsync(s, msg),
@@ -242,8 +244,7 @@ namespace crud_app_backend.Bot.Services
                     return "❌ Invalid. Reply *1*, *2* or *3*.\n\n" + LangPrompt();
             }
 
-            // ── Already verified — skip shop code, go straight to main menu ──────
-            // ShopVerified is preserved across language changes; no re-verification needed.
+            // ── Already verified — skip shop code, go straight to main menu ──
             if (s.ShopVerified)
             {
                 Transition(s, "MAIN_MENU");
@@ -253,15 +254,9 @@ namespace crud_app_backend.Bot.Services
                     $"✅ भाषा बदल गई।\n\n{BuildMainMenuBody("hi")}");
             }
 
-            // ── First-time user — ask for shop code ──────────────────────────────
+            // ── First-time user — ask for shop code ──────────────────────────
             Transition(s, "AWAITING_SHOP_CODE");
 
-            // Send shopcode image with instructions.
-            // Safe to be async here — the language loop was caused by the missing
-            // Transition(s, "AWAITING_LANG") in the global reset block, not by this.
-            // Even if SendImageAsync throws, the session object in IMemoryCache already
-            // has state=AWAITING_SHOP_CODE (Transition mutated it above), so the next
-            // message will load the correct state from cache.
             var baseUrl = _config["App:BaseUrl"]?.TrimEnd('/') ?? "https://webhook.prangroup.com";
             var shopCodeImageUrl = $"{baseUrl}/images/shopcode.jpeg";
 
@@ -310,10 +305,6 @@ namespace crud_app_backend.Bot.Services
             s.ShopCode = code;
             s.ShopUserId = shop.Value.Id;
 
-            // ── Store as "OwnerName | SiteName" so a single field carries both ──
-            // e.g.  "Mr Anas | GARMASHA GOURMENT CAFETERIA"
-            // Downstream services (CRM description, etc.) already use ShopName as a
-            // display string, so the pipe-delimited format is purely additive.
             var ownerTitleCase = System.Globalization.CultureInfo.InvariantCulture
                 .TextInfo.ToTitleCase((shop.Value.OwnerName ?? "").ToLowerInvariant()).Trim();
             s.ShopName = string.IsNullOrWhiteSpace(ownerTitleCase)
@@ -322,7 +313,6 @@ namespace crud_app_backend.Bot.Services
 
             Transition(s, "MAIN_MENU");
 
-            // ── Parse owner name back out of ShopName for the greeting ───────────
             var displayOwner = ExtractOwnerFromShopName(s.ShopName);
 
             var greeting = string.IsNullOrWhiteSpace(displayOwner)
@@ -339,7 +329,6 @@ namespace crud_app_backend.Bot.Services
                 $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("hi")}");
         }
 
-        // ── Returns the owner portion of "OwnerName | SiteName", or empty string ─
         private static string ExtractOwnerFromShopName(string? shopName)
         {
             if (string.IsNullOrWhiteSpace(shopName)) return string.Empty;
@@ -353,9 +342,9 @@ namespace crud_app_backend.Bot.Services
             {
                 var token = _config["Spror:BearerToken"] ?? "224|IEcNubBv4Z9LoXpngVuHthRrSDdIlD0B4RGxNFqT";
                 var contName = _config["Spror:ContName"] ?? "United Arab Emirates";
-                var baseUrl = _config["Spror:BaseUrl"] ?? "https://spror.prgfms.com/api/v1";
+                var baseUrl = (_config["Spror:BaseUrl"] ?? "http://spror.prgfms.com/api/v1").TrimEnd('/');
 
-                var client = _httpFactory.CreateClient();
+                var client = _httpFactory.CreateClient("Spror");
                 client.Timeout = TimeSpan.FromSeconds(15);
                 client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", $"Bearer {token}");
 
@@ -405,7 +394,6 @@ namespace crud_app_backend.Bot.Services
         private static string BuildMainMenuBody(string lang) => lang switch
         {
             "bn" =>
-
                 "1️⃣  অর্ডার দিন\n" +
                 "2️⃣  রিটার্ন / রিপ্লেসমেন্ট\n" +
                 "3️⃣  অভিযোগ / ফিডব্যাক\n" +
@@ -413,7 +401,6 @@ namespace crud_app_backend.Bot.Services
                 "0️⃣  ভাষা পরিবর্তন\n\n" +
                 "👉 *1*, *2*, *3*, *4* বা *0* পাঠান।",
             "hi" =>
-
                 "1️⃣  ऑर्डर करें\n" +
                 "2️⃣  वापसी / प्रतिस्थापन\n" +
                 "3️⃣  शिकायत / फ़ीडबैक\n" +
@@ -421,7 +408,6 @@ namespace crud_app_backend.Bot.Services
                 "0️⃣  भाषा बदलें\n\n" +
                 "👉 *1*, *2*, *3*, *4* या *0* भेजें।",
             _ =>
-
                 "1️⃣  Place Order\n" +
                 "2️⃣  Return / Replacement\n" +
                 "3️⃣  Complaint / Feedback\n" +
@@ -433,8 +419,8 @@ namespace crud_app_backend.Bot.Services
         private async Task<string> HandleMainMenu(UaeSession s, UaeIncomingMessage msg)
         {
             if (msg.MsgType != "text") return BuildUnknown(s);
-            if (msg.RawText == "1") return StartPlaceOrder(s);
-            if (msg.RawText == "2") return StartReturn(s);
+            if (msg.RawText == "1") return StartOrderMethod(s);      // ← NEW: go to method selection
+            if (msg.RawText == "2") return StartReturnMethod(s);     // ← NEW: go to method selection
             if (msg.RawText == "3") return StartComplaint(s);
             if (msg.RawText == "4") return StartAgent(s);
             if (msg.RawText == "0") return ResetToLang(s);
@@ -442,36 +428,118 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 1 — PLACE ORDER
+        // FLOW 1 — PLACE ORDER  (NEW: method selection sub-menu)
         // ─────────────────────────────────────────────────────────────────────
 
-        private string StartPlaceOrder(UaeSession s)
+        /// <summary>
+        /// Shows "Agent or Website?" prompt for Place Order.
+        /// Called when user picks 1 from main menu.
+        /// </summary>
+        private string StartOrderMethod(UaeSession s)
+        {
+            Transition(s, "AWAITING_ORDER_METHOD");
+            return s.T(
+                "🛒 *How would you like to place your order?*\n\n" +
+                "1️⃣  Support Agent\n" +
+                "2️⃣  Website\n\n" +
+                "👉 Reply *1* or *2*.\n" +
+                "Send *0* to go back to main menu",
+
+                "🛒 *আপনি কীভাবে অর্ডার দিতে চান?*\n\n" +
+                "1️⃣  সাপোর্ট এজেন্ট\n" +
+                "2️⃣  ওয়েবসাইট\n\n" +
+                "👉 *1* বা *2* পাঠান।\n" +
+                "মূল মেনুতে ফিরতে *0* পাঠান",
+
+                "🛒 *आप ऑर्डर कैसे देना चाहते हैं?*\n\n" +
+                "1️⃣  सपोर्ट एजेंट\n" +
+                "2️⃣  वेबसाइट\n\n" +
+                "👉 *1* या *2* भेजें।\n" +
+                "मुख्य मेनू पर जाने के लिए *0* भेजें");
+        }
+
+        /// <summary>
+        /// Handles the user's reply in AWAITING_ORDER_METHOD state.
+        /// 1 → agent flow, 2 → website URL, 0 → main menu.
+        /// </summary>
+        private async Task<string> HandleOrderMethodAsync(UaeSession s, UaeIncomingMessage msg)
+        {
+            if (msg.MsgType != "text") return StartOrderMethod(s);
+
+            switch (msg.RawText)
+            {
+                case "0":
+                    return BuildMainMenu(s);
+
+                case "1":
+                    // Agent flow — proceed to existing order confirmation
+                    return StartPlaceOrderViaAgent(s);
+
+                case "2":
+                    // Website flow — build URL and return to main menu
+                    return BuildOrderWebsiteReply(s);
+
+                default:
+                    return StartOrderMethod(s);
+            }
+        }
+
+        /// <summary>
+        /// Existing agent-based order flow (previously StartPlaceOrder).
+        /// Renamed to avoid confusion with the new method-selection entry point.
+        /// </summary>
+        private string StartPlaceOrderViaAgent(UaeSession s)
         {
             Transition(s, "AWAITING_ORDER_CONFIRM");
             return s.T(
-                "🛒 *Place Order*\n\n" +
+                "🛒 *Place Order via Support Agent*\n\n" +
                 "Our sales team will contact you to take your order.\n\n" +
                 "Send *Y* to Confirm\n" +
                 "Send *N* to Cancel\n\n" +
                 "👉 Send *0* to go back to main menu",
 
-                "🛒 *অর্ডার দিন*\n\n" +
+                "🛒 *এজেন্টের মাধ্যমে অর্ডার দিন*\n\n" +
                 "আমাদের সেলস টিম আপনার অর্ডার নিতে যোগাযোগ করবে।\n\n" +
                 "নিশ্চিত করতে *Y* পাঠান\n" +
                 "বাতিল করতে *N* পাঠান\n\n" +
                 "👉 মূল মেনুতে যেতে *0* পাঠান",
 
-                "🛒 *ऑर्डर करें*\n\n" +
+                "🛒 *एजेंट द्वारा ऑर्डर करें*\n\n" +
                 "हमारी सेल्स टीम आपका ऑर्डर लेने के लिए संपर्क करेगी।\n\n" +
                 "*Y* भेजें पुष्टि के लिए\n" +
                 "*N* भेजें रद्द करने के लिए\n\n" +
                 "👉 मुख्य मेनू पर जाने के लिए *0* भेजें");
         }
 
+        /// <summary>
+        /// Builds the website order URL reply and transitions back to MAIN_MENU.
+        /// URL pattern: https://myorder.prangroup.com/?cont_id=3&order=1&shopCode={shopCode}
+        /// </summary>
+        private string BuildOrderWebsiteReply(UaeSession s)
+        {
+            var shopCode = s.ShopCode ?? "";
+            var url = $"{WebsiteBaseUrl}/?cont_id={WebsiteContId}&order=1&shopCode={shopCode}";
+
+            Transition(s, "MAIN_MENU");
+
+            return s.T(
+                $"🌐 *Place your order on our website:*\n\n" +
+                $"{url}\n\n" +
+                "👉 Send *menu* for Main Menu",
+
+                $"🌐 *আমাদের ওয়েবসাইটে অর্ডার করুন:*\n\n" +
+                $"{url}\n\n" +
+                "👉 *menu* — মূল মেনু",
+
+                $"🌐 *हमारी वेबसाइट पर ऑर्डर करें:*\n\n" +
+                $"{url}\n\n" +
+                "👉 *menu* — मुख्य मेनू");
+        }
+
         private async Task<string> HandleOrderConfirmAsync(UaeSession s, UaeIncomingMessage msg)
         {
             if (msg.RawText == "n" || msg.RawText == "0") return BuildMainMenu(s);
-            if (msg.RawText != "y") return StartPlaceOrder(s);
+            if (msg.RawText != "y") return StartPlaceOrderViaAgent(s);
 
             var req = new UaeCrmRequest
             {
@@ -483,20 +551,19 @@ namespace crud_app_backend.Bot.Services
 
             var result = await _crm.SubmitAsync(req);
 
-            // ── Persist ticket to local DB ────────────────────────────────────
             await _complaintRepo.AddAsync(new crud_app_backend.Models.WhatsAppComplaint
             {
-                Phone           = s.Phone,
-                ShopCode        = req.ShopCode,
-                ShopName        = s.ShopName,
-                TicketType      = req.TicketType,
-                TicketCategory  = "UAE_Chatbot",
-                Description     = req.Description,
-                CartItems       = req.CartItems,
-                Status          = result.Success ? "SUCCESS" : "FAILED",
+                Phone = s.Phone,
+                ShopCode = req.ShopCode,
+                ShopName = s.ShopName,
+                TicketType = req.TicketType,
+                TicketCategory = "KSA_Chatbot",
+                Description = req.Description,
+                CartItems = req.CartItems,
+                Status = result.Success ? "SUCCESS" : "FAILED",
                 ExternalTicketId = result.TicketId,
-                CreatedAt       = DateTime.UtcNow,
-                UpdatedAt       = DateTime.UtcNow,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
             });
 
             Transition(s, "MAIN_MENU");
@@ -524,40 +591,122 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 2 — RETURN / REPLACEMENT
+        // FLOW 2 — RETURN / REPLACEMENT  (NEW: method selection sub-menu)
         // ─────────────────────────────────────────────────────────────────────
 
-        private string StartReturn(UaeSession s)
+        /// <summary>
+        /// Shows "Agent or Website?" prompt for Return/Replacement.
+        /// Called when user picks 2 from main menu.
+        /// </summary>
+        private string StartReturnMethod(UaeSession s)
+        {
+            Transition(s, "AWAITING_RETURN_METHOD");
+            return s.T(
+                "🔄 *How would you like to proceed?*\n\n" +
+                "1️⃣  Support Agent\n" +
+                "2️⃣  Website\n\n" +
+                "👉 Reply *1* or *2*.\n" +
+                "Send *0* to go back to main menu",
+
+                "🔄 *আপনি কীভাবে এগিয়ে যেতে চান?*\n\n" +
+                "1️⃣  সাপোর্ট এজেন্ট\n" +
+                "2️⃣  ওয়েবসাইট\n\n" +
+                "👉 *1* বা *2* পাঠান।\n" +
+                "মূল মেনুতে ফিরতে *0* পাঠান",
+
+                "🔄 *आप कैसे आगे बढ़ना चाहते हैं?*\n\n" +
+                "1️⃣  सपोर्ट एजेंट\n" +
+                "2️⃣  वेबसाइट\n\n" +
+                "👉 *1* या *2* भेजें।\n" +
+                "मुख्य मेनू पर जाने के लिए *0* भेजें");
+        }
+
+        /// <summary>
+        /// Handles the user's reply in AWAITING_RETURN_METHOD state.
+        /// 1 → agent flow, 2 → website URL, 0 → main menu.
+        /// </summary>
+        private async Task<string> HandleReturnMethodAsync(UaeSession s, UaeIncomingMessage msg)
+        {
+            if (msg.MsgType != "text") return StartReturnMethod(s);
+
+            switch (msg.RawText)
+            {
+                case "0":
+                    return BuildMainMenu(s);
+
+                case "1":
+                    // Agent flow — proceed to existing return details flow
+                    return StartReturnViaAgent(s);
+
+                case "2":
+                    // Website flow — build URL and return to main menu
+                    return BuildReturnWebsiteReply(s);
+
+                default:
+                    return StartReturnMethod(s);
+            }
+        }
+
+        /// <summary>
+        /// Existing agent-based return flow (previously StartReturn).
+        /// Renamed to avoid confusion with the new method-selection entry point.
+        /// </summary>
+        private string StartReturnViaAgent(UaeSession s)
         {
             ClearMedia(s);
             Transition(s, "AWAITING_RETURN_DETAILS");
             return s.T(
-                "🔄 *Return / Replacement*\n\n" +
+                "🔄 *Return / Replacement via Support Agent*\n\n" +
                 "Tell us the product you want to return.\n\n" +
                 "Send *Text*, *Image*, or *Voice*\n\n" +
                 "👉 Send *0* to go back to main menu",
 
-                "🔄 *রিটার্ন / রিপ্লেসমেন্ট*\n\n" +
+                "🔄 *এজেন্টের মাধ্যমে রিটার্ন / রিপ্লেসমেন্ট*\n\n" +
                 "যে পণ্যটি ফেরত দিতে চান তা জানান।\n\n" +
                 "*টেক্সট*, *ছবি* বা *ভয়েস* পাঠান\n\n" +
                 "👉 মূল মেনুতে ফিরতে *0* পাঠান",
 
-                "🔄 *वापसी / प्रतिस्थापन*\n\n" +
+                "🔄 *एजेंट द्वारा वापसी / प्रतिस्थापन*\n\n" +
                 "जो उत्पाद वापस करना है उसके बारे में बताएं।\n\n" +
                 "*टेक्स्ट*, *फ़ोटो* या *आवाज़* भेजें\n\n" +
                 "👉 मुख्य मेनू पर जाने के लिए *0* भेजें");
         }
 
+        /// <summary>
+        /// Builds the website return URL reply and transitions back to MAIN_MENU.
+        /// URL pattern: https://myorder.prangroup.com/?cont_id=3&order=0&shopCode={shopCode}
+        /// </summary>
+        private string BuildReturnWebsiteReply(UaeSession s)
+        {
+            var shopCode = s.ShopCode ?? "";
+            var url = $"{WebsiteBaseUrl}/?cont_id={WebsiteContId}&order=0&shopCode={shopCode}";
+
+            Transition(s, "MAIN_MENU");
+
+            return s.T(
+                $"🌐 *Submit your return request on our website:*\n\n" +
+                $"{url}\n\n" +
+                "👉 Send *menu* for Main Menu",
+
+                $"🌐 *আমাদের ওয়েবসাইটে রিটার্ন রিকোয়েস্ট করুন:*\n\n" +
+                $"{url}\n\n" +
+                "👉 *menu* — মূল মেনু",
+
+                $"🌐 *हमारी वेबसाइट पर वापसी अनुरोध करें:*\n\n" +
+                $"{url}\n\n" +
+                "👉 *menu* — मुख्य मेनू");
+        }
+
         private async Task<string> HandleReturnConfirmAsync(UaeSession s, UaeIncomingMessage msg)
         {
             if (msg.RawText == "y") return await SubmitMediaAsync(s, "PRODUCT_REPLACEMENT");
-            if (msg.RawText == "n") { ClearMedia(s); return StartReturn(s); }
+            if (msg.RawText == "n") { ClearMedia(s); return StartReturnViaAgent(s); }
             Transition(s, "AWAITING_RETURN_DETAILS");
             return await HandleMediaDetailsAsync(s, msg, "return");
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 3 — COMPLAINT / FEEDBACK
+        // FLOW 3 — COMPLAINT / FEEDBACK  (unchanged)
         // ─────────────────────────────────────────────────────────────────────
 
         private string StartComplaint(UaeSession s)
@@ -616,8 +765,6 @@ namespace crud_app_backend.Bot.Services
                 if (imageId != null)
                 {
                     s.MediaImages.Add(imageId);
-                    // Capture URL for WhatsAppSessionHistory.RawMessage.
-                    // If the universal block already set it, keep it; otherwise build from disk path.
                     if (string.IsNullOrWhiteSpace(msg.SavedFileUrl))
                     {
                         var baseUrl2 = (_config["App:BaseUrl"] ?? "http://localhost:8041").TrimEnd('/');
@@ -631,8 +778,6 @@ namespace crud_app_backend.Bot.Services
                         "⚠️ फ़ोटो अपलोड नहीं हुई। पुनः भेजें।");
 
                 // ── Confirm message burst suppression ──────────────────────────
-                // "confirm:{phone}" key — separate from "ack:{phone}" in GetAckMessage.
-                // Ensures only ONE "✅ Received" is sent per gallery batch (5s window).
                 {
                     var now = msg.Timestamp > 0
                         ? DateTimeOffset.FromUnixTimeSeconds(msg.Timestamp).UtcDateTime
@@ -652,7 +797,6 @@ namespace crud_app_backend.Bot.Services
                 if (voiceId != null)
                 {
                     s.MediaVoices.Add(voiceId);
-                    // Same as image — ensure SavedFileUrl is set for RawMessage.
                     if (string.IsNullOrWhiteSpace(msg.SavedFileUrl))
                     {
                         var baseUrl2 = (_config["App:BaseUrl"] ?? "http://localhost:8041").TrimEnd('/');
@@ -703,20 +847,19 @@ namespace crud_app_backend.Bot.Services
 
             var result = await _crm.SubmitAsync(req);
 
-            // ── Persist ticket to local DB ────────────────────────────────────
             await _complaintRepo.AddAsync(new crud_app_backend.Models.WhatsAppComplaint
             {
-                Phone           = s.Phone,
-                ShopCode        = req.ShopCode,
-                ShopName        = s.ShopName,
-                TicketType      = req.TicketType,
-                TicketCategory  = "UAE_Chatbot",
-                Description     = req.Description,
-                CartItems       = req.CartItems,
-                Status          = result.Success ? "SUCCESS" : "FAILED",
+                Phone = s.Phone,
+                ShopCode = req.ShopCode,
+                ShopName = s.ShopName,
+                TicketType = req.TicketType,
+                TicketCategory = "UAE_Chatbot",
+                Description = req.Description,
+                CartItems = req.CartItems,
+                Status = result.Success ? "SUCCESS" : "FAILED",
                 ExternalTicketId = result.TicketId,
-                CreatedAt       = DateTime.UtcNow,
-                UpdatedAt       = DateTime.UtcNow,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
             });
 
             ClearMedia(s);
@@ -750,7 +893,7 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 4 — CONNECT WITH SUPPORT AGENT
+        // FLOW 4 — CONNECT WITH SUPPORT AGENT  (unchanged)
         // ─────────────────────────────────────────────────────────────────────
 
         private string StartAgent(UaeSession s)
@@ -799,20 +942,19 @@ namespace crud_app_backend.Bot.Services
 
             var result = await _crm.SubmitAsync(req);
 
-            // ── Persist ticket to local DB ────────────────────────────────────
             await _complaintRepo.AddAsync(new crud_app_backend.Models.WhatsAppComplaint
             {
-                Phone           = s.Phone,
-                ShopCode        = req.ShopCode,
-                ShopName        = s.ShopName,
-                TicketType      = req.TicketType,
-                TicketCategory  = "UAE_Chatbot",
-                Description     = req.Description,
-                CartItems       = req.CartItems,
-                Status          = result.Success ? "SUCCESS" : "FAILED",
+                Phone = s.Phone,
+                ShopCode = req.ShopCode,
+                ShopName = s.ShopName,
+                TicketType = req.TicketType,
+                TicketCategory = "UAE_Chatbot",
+                Description = req.Description,
+                CartItems = req.CartItems,
+                Status = result.Success ? "SUCCESS" : "FAILED",
                 ExternalTicketId = result.TicketId,
-                CreatedAt       = DateTime.UtcNow,
-                UpdatedAt       = DateTime.UtcNow,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
             });
 
             Transition(s, "MAIN_MENU");
@@ -921,7 +1063,6 @@ namespace crud_app_backend.Bot.Services
                     _logger.LogWarning(dbEx, "[UAE] Media DB insert failed (file saved OK): {Id}", messageId);
                 }
 
-                // Return full disk path — UaeCrmService reads bytes from here
                 return filePath;
             }
             catch (HttpRequestException httpEx)
@@ -965,7 +1106,6 @@ namespace crud_app_backend.Bot.Services
 
         private async Task PersistSessionAsync(UaeSession s, string rawText, string? fileUrl = null)
         {
-
             _cache.Set($"uae:{s.Phone}", s,
                 new MemoryCacheEntryOptions().SetSlidingExpiration(TimeSpan.FromMinutes(60)));
             try
@@ -976,8 +1116,6 @@ namespace crud_app_backend.Bot.Services
                     CurrentStep = s.State,
                     PreviousStep = s.PreviousState,
                     TempData = s.Save(),
-                    // RawMessage: for media messages rawText="" and fileUrl=public URL.
-                    // For text messages fileUrl=null and rawText=message body.
                     RawMessage = !string.IsNullOrWhiteSpace(fileUrl)
                         ? (string.IsNullOrWhiteSpace(rawText) ? fileUrl : $"{rawText} | {fileUrl}")
                         : rawText,
@@ -990,8 +1128,6 @@ namespace crud_app_backend.Bot.Services
                     s.Phone, s.State, ex.Message, ex.InnerException?.Message ?? "none");
             }
         }
-
-
 
         private static void Transition(UaeSession s, string newState)
         {
@@ -1060,8 +1196,7 @@ namespace crud_app_backend.Bot.Services
         public string ImageMime { get; set; } = "image/jpeg";
         public string ImageCaption { get; set; } = "";
         public string? SavedFileUrl { get; set; }
-        public string? SavedFilePath { get; set; }  // disk path set after successful save
-
+        public string? SavedFilePath { get; set; }
     }
 
     public static class UaeMessageParser

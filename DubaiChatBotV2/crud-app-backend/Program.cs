@@ -54,6 +54,15 @@ builder.Services.AddHttpClient("CrmClient", client =>
     client.Timeout = TimeSpan.FromSeconds(60);
 });
 
+// Spror (shop validation — uses http, cert mismatch bypass not needed)
+builder.Services.AddHttpClient("Spror", client =>
+{
+    var token = builder.Configuration["Spror:BearerToken"];
+    if (!string.IsNullOrWhiteSpace(token))
+        client.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", $"Bearer {token}");
+    client.Timeout = TimeSpan.FromSeconds(15);
+});
+
 // ── Form limits ───────────────────────────────────────────────────────────────
 builder.Services.Configure<FormOptions>(o =>
 {
