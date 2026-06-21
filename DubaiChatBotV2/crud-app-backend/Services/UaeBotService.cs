@@ -557,7 +557,7 @@ namespace crud_app_backend.Bot.Services
                 ShopCode = req.ShopCode,
                 ShopName = s.ShopName,
                 TicketType = req.TicketType,
-                TicketCategory = "KSA_Chatbot",
+                TicketCategory = "UAE_Chatbot",
                 Description = req.Description,
                 CartItems = req.CartItems,
                 Status = result.Success ? "SUCCESS" : "FAILED",
