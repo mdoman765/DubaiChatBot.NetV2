@@ -211,12 +211,6 @@ namespace crud_app_backend.Bot.Services
                 "AWAITING_SHOP_CODE" => await HandleShopCodeAsync(s, msg),
                 "MAIN_MENU" => await HandleMainMenu(s, msg),
 
-                // ── NEW: method-selection states ─────────────────────────────
-                "AWAITING_ORDER_METHOD" => await HandleOrderMethodAsync(s, msg),
-                "AWAITING_RETURN_METHOD" => await HandleReturnMethodAsync(s, msg),
-                // ─────────────────────────────────────────────────────────────
-
-                "AWAITING_ORDER_CONFIRM" => await HandleOrderConfirmAsync(s, msg),
                 "AWAITING_RETURN_DETAILS" => await HandleMediaDetailsAsync(s, msg, "return"),
                 "AWAITING_RETURN_CONFIRM" => await HandleReturnConfirmAsync(s, msg),
                 "AWAITING_COMPLAINT_DETAILS" => await HandleMediaDetailsAsync(s, msg, "complaint"),
@@ -419,8 +413,8 @@ namespace crud_app_backend.Bot.Services
         private async Task<string> HandleMainMenu(UaeSession s, UaeIncomingMessage msg)
         {
             if (msg.MsgType != "text") return BuildUnknown(s);
-            if (msg.RawText == "1") return StartOrderMethod(s);      // ← NEW: go to method selection
-            if (msg.RawText == "2") return StartReturnMethod(s);     // ← NEW: go to method selection
+            if (msg.RawText == "1") return BuildOrderWebsiteReply(s);
+            if (msg.RawText == "2") return BuildReturnWebsiteReply(s);
             if (msg.RawText == "3") return StartComplaint(s);
             if (msg.RawText == "4") return StartAgent(s);
             if (msg.RawText == "0") return ResetToLang(s);
@@ -428,88 +422,8 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 1 — PLACE ORDER  (NEW: method selection sub-menu)
+        // FLOW 1 — PLACE ORDER  (website URL only)
         // ─────────────────────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Shows "Agent or Website?" prompt for Place Order.
-        /// Called when user picks 1 from main menu.
-        /// </summary>
-        private string StartOrderMethod(UaeSession s)
-        {
-            Transition(s, "AWAITING_ORDER_METHOD");
-            return s.T(
-                "🛒 *How would you like to place your order?*\n\n" +
-                "1️⃣  Support Agent\n" +
-                "2️⃣  Website\n\n" +
-                "👉 Reply *1* or *2*.\n" +
-                "Send *0* to go back to main menu",
-
-                "🛒 *আপনি কীভাবে অর্ডার দিতে চান?*\n\n" +
-                "1️⃣  সাপোর্ট এজেন্ট\n" +
-                "2️⃣  ওয়েবসাইট\n\n" +
-                "👉 *1* বা *2* পাঠান।\n" +
-                "মূল মেনুতে ফিরতে *0* পাঠান",
-
-                "🛒 *आप ऑर्डर कैसे देना चाहते हैं?*\n\n" +
-                "1️⃣  सपोर्ट एजेंट\n" +
-                "2️⃣  वेबसाइट\n\n" +
-                "👉 *1* या *2* भेजें।\n" +
-                "मुख्य मेनू पर जाने के लिए *0* भेजें");
-        }
-
-        /// <summary>
-        /// Handles the user's reply in AWAITING_ORDER_METHOD state.
-        /// 1 → agent flow, 2 → website URL, 0 → main menu.
-        /// </summary>
-        private async Task<string> HandleOrderMethodAsync(UaeSession s, UaeIncomingMessage msg)
-        {
-            if (msg.MsgType != "text") return StartOrderMethod(s);
-
-            switch (msg.RawText)
-            {
-                case "0":
-                    return BuildMainMenu(s);
-
-                case "1":
-                    // Agent flow — proceed to existing order confirmation
-                    return StartPlaceOrderViaAgent(s);
-
-                case "2":
-                    // Website flow — build URL and return to main menu
-                    return BuildOrderWebsiteReply(s);
-
-                default:
-                    return StartOrderMethod(s);
-            }
-        }
-
-        /// <summary>
-        /// Existing agent-based order flow (previously StartPlaceOrder).
-        /// Renamed to avoid confusion with the new method-selection entry point.
-        /// </summary>
-        private string StartPlaceOrderViaAgent(UaeSession s)
-        {
-            Transition(s, "AWAITING_ORDER_CONFIRM");
-            return s.T(
-                "🛒 *Place Order via Support Agent*\n\n" +
-                "Our sales team will contact you to take your order.\n\n" +
-                "Send *Y* to Confirm\n" +
-                "Send *N* to Cancel\n\n" +
-                "👉 Send *0* to go back to main menu",
-
-                "🛒 *এজেন্টের মাধ্যমে অর্ডার দিন*\n\n" +
-                "আমাদের সেলস টিম আপনার অর্ডার নিতে যোগাযোগ করবে।\n\n" +
-                "নিশ্চিত করতে *Y* পাঠান\n" +
-                "বাতিল করতে *N* পাঠান\n\n" +
-                "👉 মূল মেনুতে যেতে *0* পাঠান",
-
-                "🛒 *एजेंट द्वारा ऑर्डर करें*\n\n" +
-                "हमारी सेल्स टीम आपका ऑर्डर लेने के लिए संपर्क करेगी।\n\n" +
-                "*Y* भेजें पुष्टि के लिए\n" +
-                "*N* भेजें रद्द करने के लिए\n\n" +
-                "👉 मुख्य मेनू पर जाने के लिए *0* भेजें");
-        }
 
         /// <summary>
         /// Builds the website order URL reply and transitions back to MAIN_MENU.
@@ -536,141 +450,9 @@ namespace crud_app_backend.Bot.Services
                 "👉 *menu* — मुख्य मेनू");
         }
 
-        private async Task<string> HandleOrderConfirmAsync(UaeSession s, UaeIncomingMessage msg)
-        {
-            if (msg.RawText == "n" || msg.RawText == "0") return BuildMainMenu(s);
-            if (msg.RawText != "y") return StartPlaceOrderViaAgent(s);
-
-            var req = new UaeCrmRequest
-            {
-                ShopCode = s.ShopCode ?? "",
-                WhatsappNumber = s.Phone,
-                TicketType = "PLACE_ORDER",
-                Description = $"Place order request from shop: {s.ShopName ?? s.ShopCode}",
-            };
-
-            var result = await _crm.SubmitAsync(req);
-
-            await _complaintRepo.AddAsync(new crud_app_backend.Models.WhatsAppComplaint
-            {
-                Phone = s.Phone,
-                ShopCode = req.ShopCode,
-                ShopName = s.ShopName,
-                TicketType = req.TicketType,
-                TicketCategory = "UAE_Chatbot",
-                Description = req.Description,
-                CartItems = req.CartItems,
-                Status = result.Success ? "SUCCESS" : "FAILED",
-                ExternalTicketId = result.TicketId,
-                CreatedAt = DateTime.UtcNow,
-                UpdatedAt = DateTime.UtcNow,
-            });
-
-            Transition(s, "MAIN_MENU");
-
-            return result.Success
-                ? s.T(
-                    "✅ *Order Request Submitted*\n\n" +
-                    (result.TicketId != null ? $"Ticket ID : *{result.TicketId}*\n\n" : "") +
-                    "Our sales team will contact you shortly to take your order.\n\n" +
-                    "👉 Send *menu* for Main Menu\n",
-
-                    "✅ *অর্ডার রিকোয়েস্ট জমা হয়েছে*\n\n" +
-                    (result.TicketId != null ? $"টিকেট আইডি : *{result.TicketId}*\n\n" : "") +
-                    "আমাদের সেলস টিম শীঘ্রই অর্ডার নিতে যোগাযোগ করবে।\n\n" +
-                    "👉 *menu* — মূল মেনু\n",
-
-                    "✅ *ऑर्डर अनुरोध जमा हुआ*\n\n" +
-                    (result.TicketId != null ? $"टिकट ID : *{result.TicketId}*\n\n" : "") +
-                    "हमारी सेल्स टीम जल्द आपसे संपर्क कर ऑर्डर लेगी।\n\n" +
-                    "👉 *menu* — मुख्य मेनू\n")
-                : s.T(
-                    $"❌ Request failed.\n{result.Error}\n\nSend *Y* to retry or *menu* for main menu.",
-                    $"❌ ব্যর্থ।\n{result.Error}\n\n*Y* পাঠিয়ে আবার চেষ্টা করুন।",
-                    $"❌ विफल।\n{result.Error}\n\n*Y* भेजें पुनः प्रयास के लिए।");
-        }
-
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 2 — RETURN / REPLACEMENT  (NEW: method selection sub-menu)
+        // FLOW 2 — RETURN / REPLACEMENT  (website URL only)
         // ─────────────────────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Shows "Agent or Website?" prompt for Return/Replacement.
-        /// Called when user picks 2 from main menu.
-        /// </summary>
-        private string StartReturnMethod(UaeSession s)
-        {
-            Transition(s, "AWAITING_RETURN_METHOD");
-            return s.T(
-                "🔄 *How would you like to proceed?*\n\n" +
-                "1️⃣  Support Agent\n" +
-                "2️⃣  Website\n\n" +
-                "👉 Reply *1* or *2*.\n" +
-                "Send *0* to go back to main menu",
-
-                "🔄 *আপনি কীভাবে এগিয়ে যেতে চান?*\n\n" +
-                "1️⃣  সাপোর্ট এজেন্ট\n" +
-                "2️⃣  ওয়েবসাইট\n\n" +
-                "👉 *1* বা *2* পাঠান।\n" +
-                "মূল মেনুতে ফিরতে *0* পাঠান",
-
-                "🔄 *आप कैसे आगे बढ़ना चाहते हैं?*\n\n" +
-                "1️⃣  सपोर्ट एजेंट\n" +
-                "2️⃣  वेबसाइट\n\n" +
-                "👉 *1* या *2* भेजें।\n" +
-                "मुख्य मेनू पर जाने के लिए *0* भेजें");
-        }
-
-        /// <summary>
-        /// Handles the user's reply in AWAITING_RETURN_METHOD state.
-        /// 1 → agent flow, 2 → website URL, 0 → main menu.
-        /// </summary>
-        private async Task<string> HandleReturnMethodAsync(UaeSession s, UaeIncomingMessage msg)
-        {
-            if (msg.MsgType != "text") return StartReturnMethod(s);
-
-            switch (msg.RawText)
-            {
-                case "0":
-                    return BuildMainMenu(s);
-
-                case "1":
-                    // Agent flow — proceed to existing return details flow
-                    return StartReturnViaAgent(s);
-
-                case "2":
-                    // Website flow — build URL and return to main menu
-                    return BuildReturnWebsiteReply(s);
-
-                default:
-                    return StartReturnMethod(s);
-            }
-        }
-
-        /// <summary>
-        /// Existing agent-based return flow (previously StartReturn).
-        /// Renamed to avoid confusion with the new method-selection entry point.
-        /// </summary>
-        private string StartReturnViaAgent(UaeSession s)
-        {
-            ClearMedia(s);
-            Transition(s, "AWAITING_RETURN_DETAILS");
-            return s.T(
-                "🔄 *Return / Replacement via Support Agent*\n\n" +
-                "Tell us the product you want to return.\n\n" +
-                "Send *Text*, *Image*, or *Voice*\n\n" +
-                "👉 Send *0* to go back to main menu",
-
-                "🔄 *এজেন্টের মাধ্যমে রিটার্ন / রিপ্লেসমেন্ট*\n\n" +
-                "যে পণ্যটি ফেরত দিতে চান তা জানান।\n\n" +
-                "*টেক্সট*, *ছবি* বা *ভয়েস* পাঠান\n\n" +
-                "👉 মূল মেনুতে ফিরতে *0* পাঠান",
-
-                "🔄 *एजेंट द्वारा वापसी / प्रतिस्थापन*\n\n" +
-                "जो उत्पाद वापस करना है उसके बारे में बताएं।\n\n" +
-                "*टेक्स्ट*, *फ़ोटो* या *आवाज़* भेजें\n\n" +
-                "👉 मुख्य मेनू पर जाने के लिए *0* भेजें");
-        }
 
         /// <summary>
         /// Builds the website return URL reply and transitions back to MAIN_MENU.
@@ -700,7 +482,7 @@ namespace crud_app_backend.Bot.Services
         private async Task<string> HandleReturnConfirmAsync(UaeSession s, UaeIncomingMessage msg)
         {
             if (msg.RawText == "y") return await SubmitMediaAsync(s, "PRODUCT_REPLACEMENT");
-            if (msg.RawText == "n") { ClearMedia(s); return StartReturnViaAgent(s); }
+            if (msg.RawText == "n") { ClearMedia(s); return BuildMainMenu(s); }
             Transition(s, "AWAITING_RETURN_DETAILS");
             return await HandleMediaDetailsAsync(s, msg, "return");
         }
@@ -739,7 +521,7 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // SHARED MEDIA HANDLER (Return + Complaint)
+        // SHARED MEDIA HANDLER (Complaint only — Return now uses website)
         // ─────────────────────────────────────────────────────────────────────
 
         private async Task<string> HandleMediaDetailsAsync(
@@ -816,21 +598,24 @@ namespace crud_app_backend.Bot.Services
 
             Transition(s, confirmState);
 
-            return s.T(
-                "✅ *Received.*\n\n" +
-                "Send *Y* to submit\n" +
-                "Send *N* to cancel\n\n" +
-                "To add more details, send another *Image*, *Voice* or *Text*",
+            
 
-                "✅ *পাওয়া গেছে।*\n\n" +
-                "*Y* পাঠান জমা দিতে\n" +
-                "*N* পাঠান বাতিল করতে\n\n" +
-                "আরও যোগ করতে *ছবি*, *ভয়েস* বা *টেক্সট* পাঠান",
+          
+return s.T(
+    "✅ *Received.*\n\n" +
+    "Send *Y* to Complete the request or To add more details, send another *Image*, *Voice* or *Text*",
 
-                "✅ *प्राप्त हुआ।*\n\n" +
-                "जमा करने के लिए *Y* भेजें\n" +
-                "रद्द करने के लिए *N* भेजें\n\n" +
-                "अधिक जोड़ने के लिए *फ़ोटो*, *आवाज़* या *टेक्स्ट* भेजें");
+    "✅ *পাওয়া গেছে।*\n\n" +
+    "অনুরোধ সম্পন্ন করতে *Y* পাঠান অথবা আরও তথ্য যোগ করতে *ছবি*, *ভয়েস* বা *টেক্সট* পাঠান",
+
+    "✅ *प्राप्त हुआ।*\n\n" +
+    "अनुरोध पूरा करने के लिए *Y* भेजें या अधिक जानकारी जोड़ने के लिए *फ़ोटो*, *आवाज़* या *टेक्स्ट* भेजें"
+);
+
+
+
+
+
         }
 
         private async Task<string> SubmitMediaAsync(UaeSession s, string ticketType)
