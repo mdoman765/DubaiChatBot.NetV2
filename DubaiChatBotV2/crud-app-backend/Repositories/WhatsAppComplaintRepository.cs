@@ -14,6 +14,8 @@ namespace crud_app_backend.Repositories
             _logger = logger;
         }
 
+        // ── Existing method — unchanged ───────────────────────────────────────
+
         public async Task<WhatsAppComplaint> AddAsync(WhatsAppComplaint complaint, CancellationToken ct = default)
         {
             _db.WhatsAppComplaints.Add(complaint);
@@ -23,5 +25,19 @@ namespace crud_app_backend.Repositories
                 complaint.Id, complaint.Phone, complaint.TicketType, complaint.Status, complaint.ExternalTicketId);
             return complaint;
         }
+
+        // ── New methods for CRM status-sync ──────────────────────────────────
+
+        /// <inheritdoc/>
+        public Task<WhatsAppComplaint?> GetByExternalTicketIdAsync(
+            string externalTicketId, CancellationToken ct = default)
+        {
+            return _db.WhatsAppComplaints
+                      .FirstOrDefaultAsync(c => c.ExternalTicketId == externalTicketId, ct);
+        }
+
+        /// <inheritdoc/>
+        public Task SaveChangesAsync(CancellationToken ct = default)
+            => _db.SaveChangesAsync(ct);
     }
 }
