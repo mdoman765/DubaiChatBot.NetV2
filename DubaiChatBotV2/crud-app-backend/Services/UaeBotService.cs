@@ -185,16 +185,68 @@ namespace crud_app_backend.Bot.Services
                 return string.Empty;
             }
 
+            // ── INIT: verify shop code BEFORE showing language screen ─────────
+            // The very first inbound message (typically from a QR-code deep link,
+            // e.g. "Hello, I am from Lakshmi Enterprise (Code: 885572322)") is
+            // parsed for a shop code and validated. Regardless of the outcome,
+            // we always proceed to the language screen — but flag verification
+            // status on the session so the main menu can hide Order/Return for
+            // unverified shops later.
             if (s.State == "INIT")
             {
+                var code = ExtractShopCode(raw);
+                var customerName = ExtractCustomerName(raw, msg.SenderName);
+                var shop = await ValidateShopAsync(code);
+
+                if (shop != null)
+                {
+                    s.ShopVerified = true;
+                    s.ShopCode = code;
+                    s.ShopUserId = shop.Value.Id;
+
+                    var ownerTitleCase = System.Globalization.CultureInfo.InvariantCulture
+                        .TextInfo.ToTitleCase((shop.Value.OwnerName ?? "").ToLowerInvariant()).Trim();
+                    s.ShopName = string.IsNullOrWhiteSpace(ownerTitleCase)
+                        ? shop.Value.SiteName
+                        : $"{ownerTitleCase} | {shop.Value.SiteName}";
+
+                    // ★ If the message had no "from ... (Code: ...)" name pattern (i.e. user
+                    // just sent a bare code), prefer the verified shop owner's name over
+                    // the raw WhatsApp profile name for the greeting.
+                    var nameWasInMessage = System.Text.RegularExpressions.Regex.IsMatch(
+                        raw, @"from\s+(.+?)\s*\(?\s*code",
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                    if (!nameWasInMessage && !string.IsNullOrWhiteSpace(ownerTitleCase))
+                        customerName = ownerTitleCase;
+                }
+                else
+                {
+                    s.ShopVerified = false;
+                    s.ShopCode = code;
+                }
+
                 Transition(s, "AWAITING_LANG");
-                await SendWelcomeAsync(msg.From);
+                await SendWelcomeAsync(msg.From, customerName);
                 return string.Empty;
             }
 
             // Global shortcuts (shop-verified users only)
             if (s.ShopVerified)
             {
+                if (msg.MsgType == "text" && raw == "menu")
+                    return BuildMainMenu(s);
+
+                if (msg.MsgType == "text" && raw == "s")
+                {
+                    Transition(s, "AWAITING_AGENT_CONFIRM_1");
+                    return BuildAgentConfirm1(s);
+                }
+            }
+            else
+            {
+                // Unverified shops can still reach the menu keyword and agent shortcut,
+                // since Complaint/Feedback and Support Agent remain available to them.
                 if (msg.MsgType == "text" && raw == "menu")
                     return BuildMainMenu(s);
 
@@ -222,6 +274,66 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
+        // SHOP CODE EXTRACTION (from QR-code deep-link first message)
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Extracts a shop code from the first inbound message, which may be a
+        /// free-form deep-link greeting like:
+        /// "Hello, I am from Lakshmi Enterprise (Code: 885572322)"
+        /// Falls back to the raw trimmed text if no "Code:" / numeric pattern
+        /// is found, preserving old behaviour for plain code entries.
+        /// </summary>
+        private static string ExtractShopCode(string rawText)
+        {
+            if (string.IsNullOrWhiteSpace(rawText)) return rawText?.Trim() ?? "";
+
+            // Matches "code: 123456", "code : 123456", "(code 123456)", "code-123456" etc.
+            var match = System.Text.RegularExpressions.Regex.Match(
+                rawText,
+                @"code\s*[:\-]?\s*(\d{3,})",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            if (match.Success)
+                return match.Groups[1].Value.Trim();
+
+            // Fallback: if the text has no "code" keyword but contains a long
+            // numeric run (e.g. user just pastes the number alone), grab it.
+            var numMatch = System.Text.RegularExpressions.Regex.Match(rawText, @"\d{4,}");
+            if (numMatch.Success)
+                return numMatch.Value.Trim();
+
+            // No pattern matched — preserve original behaviour (whole text as code)
+            return rawText.Trim();
+        }
+
+        /// <summary>
+        /// Extracts a display name from the first inbound message, e.g.
+        /// "Hello, I am from Jai Hind Restaurant (Code: 10400691)" → "Jai Hind Restaurant".
+        /// Falls back to the WhatsApp profile name, then empty string.
+        /// </summary>
+        private static string ExtractCustomerName(string rawText, string senderName)
+        {
+            if (!string.IsNullOrWhiteSpace(rawText))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(
+                    rawText,
+                    @"from\s+(.+?)\s*\(?\s*code",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+                if (match.Success)
+                {
+                    var name = match.Groups[1].Value.Trim().Trim('(', ')', '-', ',');
+                    if (!string.IsNullOrWhiteSpace(name))
+                        return System.Globalization.CultureInfo.InvariantCulture
+                            .TextInfo.ToTitleCase(name.ToLowerInvariant());
+                }
+            }
+
+            return string.IsNullOrWhiteSpace(senderName) ? "" : senderName.Trim();
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         // LANGUAGE SELECTION
         // ─────────────────────────────────────────────────────────────────────
 
@@ -238,44 +350,28 @@ namespace crud_app_backend.Bot.Services
                     return "❌ Invalid. Reply *1*, *2* or *3*.\n\n" + LangPrompt();
             }
 
-            // ── Already verified — skip shop code, go straight to main menu ──
+            // ── Shop verification was already attempted at INIT. Always go
+            //    straight to MAIN_MENU; the menu body itself adapts based on
+            //    s.ShopVerified (Order/Return hidden for unverified shops). ──
+            Transition(s, "MAIN_MENU");
+
             if (s.ShopVerified)
             {
-                Transition(s, "MAIN_MENU");
                 return s.T(
-                    $"✅ Language updated.\n\n{BuildMainMenuBody("en")}",
-                    $"✅ ভাষা পরিবর্তন হয়েছে।\n\n{BuildMainMenuBody("bn")}",
-                    $"✅ भाषा बदल गई।\n\n{BuildMainMenuBody("hi")}");
+                    $"✅ Language updated.\n\n{BuildMainMenuBody("en", true)}",
+                    $"✅ ভাষা পরিবর্তন হয়েছে।\n\n{BuildMainMenuBody("bn", true)}",
+                    $"✅ भाषा बदल गई।\n\n{BuildMainMenuBody("hi", true)}");
             }
 
-            // ── First-time user — ask for shop code ──────────────────────────
-            Transition(s, "AWAITING_SHOP_CODE");
-
-            var baseUrl = _config["App:BaseUrl"]?.TrimEnd('/') ?? "https://webhook.prangroup.com";
-            var shopCodeImageUrl = $"{baseUrl}/images/shopcode.jpeg";
-
-            var caption = s.T(
-                "✅ Language set to *English*.\n\n" +
-                "👉 Please send your *Shop Code*.\n" +
-                "Your Shop Code is on your PRAN-RFL Shop Card.\n\n" +
-                "Example: *12345678*",
-
-                "✅ ভাষা বাংলায় সেট হয়েছে।\n\n" +
-                "👉 আপনার *শপ কোড* পাঠান।\n" +
-                "শপ কোড আপনার PRAN-RFL শপ কার্ডে আছে।\n\n" +
-                "উদাহরণ: *12345678*",
-
-                "✅ भाषा हिंदी में सेट है।\n\n" +
-                "👉 अपना *शॉप कोड* भेजें।\n" +
-                "शॉप कोड आपके PRAN-RFL शॉप कार्ड पर है।\n\n" +
-                "उदाहरण: *12345678*");
-
-            await _dialog.SendImageAsync(msg.From, shopCodeImageUrl, caption);
-            return string.Empty;
+            return s.T(
+                $"⚠️ Shop Code *{s.ShopCode}* not recognised. Some options are limited.\n\n{BuildMainMenuBody("en", false)}",
+                $"⚠️ শপ কোড *{s.ShopCode}* শনাক্ত হয়নি। কিছু অপশন সীমিত।\n\n{BuildMainMenuBody("bn", false)}",
+                $"⚠️ शॉप कोड *{s.ShopCode}* पहचाना नहीं गया। कुछ विकल्प सीमित हैं।\n\n{BuildMainMenuBody("hi", false)}");
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // SHOP AUTHENTICATION
+        // SHOP AUTHENTICATION (legacy AWAITING_SHOP_CODE state — kept intact
+        // for safety/back-compat, though normal flow now verifies at INIT)
         // ─────────────────────────────────────────────────────────────────────
 
         private async Task<string> HandleShopCodeAsync(UaeSession s, UaeIncomingMessage msg)
@@ -318,9 +414,9 @@ namespace crud_app_backend.Bot.Services
                       $"✅ *नमस्ते, {displayOwner}!* स्वागत है");
 
             return s.T(
-                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("en")}",
-                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("bn")}",
-                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("hi")}");
+                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("en", true)}",
+                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("bn", true)}",
+                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("hi", true)}");
         }
 
         private static string ExtractOwnerFromShopName(string? shopName)
@@ -382,47 +478,89 @@ namespace crud_app_backend.Bot.Services
         private string BuildMainMenu(UaeSession s)
         {
             Transition(s, "MAIN_MENU");
-            return BuildMainMenuBody(s.Lang ?? "en");
+            return BuildMainMenuBody(s.Lang ?? "en", s.ShopVerified);
         }
 
-        private static string BuildMainMenuBody(string lang) => lang switch
+        /// <summary>
+        /// Verified shops see the full menu (Order, Return, Complaint, Agent).
+        /// Unverified shops see a restricted menu — Order and Return/Replacement
+        /// are hidden, leaving only Complaint/Feedback and Support Agent.
+        /// </summary>
+        private static string BuildMainMenuBody(string lang, bool shopVerified = true)
         {
-            "bn" =>
-                "1️⃣  অর্ডার দিন\n" +
-                "2️⃣  রিটার্ন / রিপ্লেসমেন্ট\n" +
-                "3️⃣  অভিযোগ / ফিডব্যাক\n" +
-                "4️⃣  সাপোর্ট এজেন্ট\n" +
-                "0️⃣  ভাষা পরিবর্তন\n\n" +
-                "👉 *1*, *2*, *3*, *4* বা *0* পাঠান।",
-            "hi" =>
-                "1️⃣  ऑर्डर करें\n" +
-                "2️⃣  वापसी / प्रतिस्थापन\n" +
-                "3️⃣  शिकायत / फ़ीडबैक\n" +
-                "4️⃣  सपोर्ट एजेंट\n" +
-                "0️⃣  भाषा बदलें\n\n" +
-                "👉 *1*, *2*, *3*, *4* या *0* भेजें।",
-            _ =>
-                "1️⃣  Place Order\n" +
-                "2️⃣  Return / Replacement\n" +
-                "3️⃣  Complaint / Feedback\n" +
-                "4️⃣  Connect with Support Agent\n" +
-                "0️⃣  Change Language\n\n" +
-                "👉 Reply *1*, *2*, *3*, *4* or *0*.",
-        };
+            // ── Unverified: Complaint + Agent only ─────────────────────────────
+            if (!shopVerified) return lang switch
+            {
+                "bn" =>
+                    "1️⃣  অভিযোগ / ফিডব্যাক\n" +
+                    "2️⃣  সাপোর্ট এজেন্ট\n" +
+                    "0️⃣  ভাষা পরিবর্তন\n\n" +
+                    "👉 *1*, *2* বা *0* পাঠান।",
+                "hi" =>
+                    "1️⃣  शिकायत / फ़ीडबैक\n" +
+                    "2️⃣  सपोर्ट एजेंट\n" +
+                    "0️⃣  भाषा बदलें\n\n" +
+                    "👉 *1*, *2* या *0* भेजें।",
+                _ =>
+                    "1️⃣  Complaint / Feedback\n" +
+                    "2️⃣  Connect with Support Agent\n" +
+                    "0️⃣  Change Language\n\n" +
+                    "👉 Reply *1*, *2* or *0*.",
+            };
 
+            // ── Verified: full menu ───────────────────────────────────────────
+            return lang switch
+            {
+                "bn" =>
+                    "1️⃣  অর্ডার দিন\n" +
+                    "2️⃣  রিটার্ন / রিপ্লেসমেন্ট\n" +
+                    "3️⃣  অভিযোগ / ফিডব্যাক\n" +
+                    "4️⃣  সাপোর্ট এজেন্ট\n" +
+                    "0️⃣  ভাষা পরিবর্তন\n\n" +
+                    "👉 *1*, *2*, *3*, *4* বা *0* পাঠান।",
+                "hi" =>
+                    "1️⃣  ऑर्डर करें\n" +
+                    "2️⃣  वापसी / प्रतिस्थापन\n" +
+                    "3️⃣  शिकायत / फ़ीडबैक\n" +
+                    "4️⃣  सपोर्ट एजेंट\n" +
+                    "0️⃣  भाषा बदलें\n\n" +
+                    "👉 *1*, *2*, *3*, *4* या *0* भेजें।",
+                _ =>
+                    "1️⃣  Place Order\n" +
+                    "2️⃣  Return / Replacement\n" +
+                    "3️⃣  Complaint / Feedback\n" +
+                    "4️⃣  Connect with Support Agent\n" +
+                    "0️⃣  Change Language\n\n" +
+                    "👉 Reply *1*, *2*, *3*, *4* or *0*.",
+            };
+        }
+
+        /// <summary>
+        /// Routes MAIN_MENU input.
+        /// Verified:   1 = Place Order, 2 = Return/Replacement, 3 = Complaint, 4 = Agent, 0 = Change Language
+        /// Unverified: 1 = Complaint,   2 = Agent,                              0 = Change Language
+        /// </summary>
         private async Task<string> HandleMainMenu(UaeSession s, UaeIncomingMessage msg)
         {
             if (msg.MsgType != "text") return BuildUnknown(s);
+            if (msg.RawText == "0") return ResetToLang(s);
+
+            if (!s.ShopVerified)
+            {
+                if (msg.RawText == "1") return StartComplaint(s);
+                if (msg.RawText == "2") return StartAgent(s);
+                return BuildUnknown(s);
+            }
+
             if (msg.RawText == "1") return BuildOrderWebsiteReply(s);
             if (msg.RawText == "2") return BuildReturnWebsiteReply(s);
             if (msg.RawText == "3") return StartComplaint(s);
             if (msg.RawText == "4") return StartAgent(s);
-            if (msg.RawText == "0") return ResetToLang(s);
             return BuildUnknown(s);
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 1 — PLACE ORDER  (website URL only)
+        // FLOW 1 — PLACE ORDER  (website URL only) — verified shops only
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
@@ -451,7 +589,7 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 2 — RETURN / REPLACEMENT  (website URL only)
+        // FLOW 2 — RETURN / REPLACEMENT  (website URL only) — verified shops only
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
@@ -488,7 +626,7 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 3 — COMPLAINT / FEEDBACK  (unchanged)
+        // FLOW 3 — COMPLAINT / FEEDBACK  (unchanged — available to all shops)
         // ─────────────────────────────────────────────────────────────────────
 
         private string StartComplaint(UaeSession s)
@@ -598,10 +736,9 @@ namespace crud_app_backend.Bot.Services
 
             Transition(s, confirmState);
 
-            
 
-          
-return s.T(
+
+            return s.T(
     "✅ *Received.*\n\n" +
     "Send *Y* to Complete the request or To add more details, send another *Image*, *Voice* or *Text*",
 
@@ -611,11 +748,6 @@ return s.T(
     "✅ *प्राप्त हुआ।*\n\n" +
     "अनुरोध पूरा करने के लिए *Y* भेजें या अधिक जानकारी जोड़ने के लिए *फ़ोटो*, *आवाज़* या *टेक्स्ट* भेजें"
 );
-
-
-
-
-
         }
 
         private async Task<string> SubmitMediaAsync(UaeSession s, string ticketType)
@@ -678,7 +810,7 @@ return s.T(
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // FLOW 4 — CONNECT WITH SUPPORT AGENT  (unchanged)
+        // FLOW 4 — CONNECT WITH SUPPORT AGENT  (unchanged — available to all shops)
         // ─────────────────────────────────────────────────────────────────────
 
         private string StartAgent(UaeSession s)
@@ -770,15 +902,17 @@ return s.T(
         // WELCOME WITH LOGO
         // ─────────────────────────────────────────────────────────────────────
 
-        private async Task SendWelcomeAsync(string phone, CancellationToken ct = default)
+        private async Task SendWelcomeAsync(string phone, string customerName = "", CancellationToken ct = default)
         {
             var baseUrl = _config["App:BaseUrl"]?.TrimEnd('/') ?? "https://webhook.prangroup.com";
             var logoUrl = $"{baseUrl}/images/pran-rfl-logo.jpg";
-            await _dialog.SendImageAsync(phone, logoUrl, LangPrompt(), ct);
+            await _dialog.SendImageAsync(phone, logoUrl, LangPrompt(customerName), ct);
         }
 
-        private static string LangPrompt() =>
-            "👋 Hi! I'm *PRAN-RFL UAE Sales Support*\n\n" +
+        private static string LangPrompt(string customerName = "") =>
+            (string.IsNullOrWhiteSpace(customerName)
+                ? "👋 Hi! I'm *PRAN-RFL UAE Sales Support*\n\n"
+                : $"👋 Hi {customerName}! I'm *PRAN-RFL UAE Sales Support*\n\n") +
             "Please choose your language:\n\n" +
             "1️⃣  English\n" +
             "2️⃣  বাংলা\n" +
