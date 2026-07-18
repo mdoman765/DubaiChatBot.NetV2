@@ -27,7 +27,16 @@ builder.Services.AddScoped<IWhatsAppSessionService, WhatsAppSessionService>();
 builder.Services.AddSingleton<BotStateService>();   // per-user locks + burst detection
 builder.Services.AddSingleton<WebhookQueue>();       // Channel for instant 200 OK
 builder.Services.AddScoped<IUaeBotService, UaeBotService>();
-builder.Services.AddScoped<IDialogClient, DialogClient>();
+
+// WhatsApp send/receive provider — "Meta" (direct Cloud API) or "Dialog" (360dialog BSP).
+// Switch back to 360dialog anytime by changing "WhatsAppProvider" in appsettings.json —
+// no code change or redeploy needed.
+var whatsAppProvider = builder.Configuration["WhatsAppProvider"] ?? "Meta";
+if (whatsAppProvider.Equals("Meta", StringComparison.OrdinalIgnoreCase))
+    builder.Services.AddScoped<IDialogClient, MetaWhatsAppClient>();
+else
+    builder.Services.AddScoped<IDialogClient, DialogClient>();
+
 builder.Services.AddScoped<IUaeCrmService, UaeCrmService>();
 
 // ── Background services ───────────────────────────────────────────────────────
@@ -36,7 +45,17 @@ builder.Services.AddHostedService<KeepAliveService>();
 
 // ── HTTP clients ──────────────────────────────────────────────────────────────
 
-// 360dialog
+// Meta Cloud API (direct)
+builder.Services.AddHttpClient("Meta", client =>
+{
+    var token = builder.Configuration["Meta:AccessToken"];
+    if (!string.IsNullOrWhiteSpace(token))
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", token);
+    client.Timeout = TimeSpan.FromSeconds(30);
+});
+
+// 360dialog — kept registered for rollback capability even if unused
 builder.Services.AddHttpClient("Dialog", client =>
 {
     var key = builder.Configuration["Dialog:ApiKey"];

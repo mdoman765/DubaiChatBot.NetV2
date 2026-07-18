@@ -6,6 +6,7 @@ namespace crud_app_backend.Bot.Services
     /// Wraps the 360dialog v2 API.
     ///   Send text:  POST https://waba-v2.360dialog.io/messages  (type=text)
     ///   Send image: POST https://waba-v2.360dialog.io/messages  (type=image, link=url)
+    ///   Send voice: POST https://waba-v2.360dialog.io/messages  (type=audio, link=url)
     ///   Media:      GET  https://waba-v2.360dialog.io/{mediaId}
     ///   Auth:       D360-API-KEY header (registered as "Dialog" named client)
     /// </summary>
@@ -13,13 +14,13 @@ namespace crud_app_backend.Bot.Services
     {
         private const string BaseUrl = "https://waba-v2.360dialog.io";
 
-        private readonly IHttpClientFactory    _factory;
+        private readonly IHttpClientFactory _factory;
         private readonly ILogger<DialogClient> _logger;
 
         public DialogClient(IHttpClientFactory factory, ILogger<DialogClient> logger)
         {
             _factory = factory;
-            _logger  = logger;
+            _logger = logger;
         }
 
         // ── Send text ─────────────────────────────────────────────────────────
@@ -33,7 +34,7 @@ namespace crud_app_backend.Bot.Services
             var payload = new
             {
                 messaging_product = "whatsapp",
-                to   = phone,
+                to = phone,
                 type = "text",
                 text = new { body = message }
             };
@@ -72,11 +73,11 @@ namespace crud_app_backend.Bot.Services
             var payload = new
             {
                 messaging_product = "whatsapp",
-                to   = phone,
+                to = phone,
                 type = "image",
                 image = new
                 {
-                    link    = imageUrl, // 360dialog fetches image from this public URL
+                    link = imageUrl, // 360dialog fetches image from this public URL
                     caption = caption   // shown below the image in WhatsApp
                 }
             };
@@ -96,6 +97,40 @@ namespace crud_app_backend.Bot.Services
             else
             {
                 _logger.LogDebug("[Dialog] Image sent to {Phone}", phone);
+            }
+        }
+
+        // ── Send voice note ────────────────────────────────────────────────────
+
+        public async Task SendVoiceAsync(string phone, string audioUrl,
+            CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(audioUrl))
+            {
+                _logger.LogWarning("[Dialog] SendVoice — no audioUrl, skipping");
+                return;
+            }
+
+            var client = _factory.CreateClient("Dialog");
+            var payload = new
+            {
+                messaging_product = "whatsapp",
+                to = phone,
+                type = "audio",
+                audio = new { link = audioUrl }
+            };
+
+            var resp = await client.PostAsJsonAsync($"{BaseUrl}/messages", payload, ct);
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                var body = await resp.Content.ReadAsStringAsync(ct);
+                _logger.LogWarning("[Dialog] SendVoice failed {Code} to {Phone}: {Body}",
+                    (int)resp.StatusCode, phone, body.Length > 200 ? body[..200] : body);
+            }
+            else
+            {
+                _logger.LogDebug("[Dialog] Voice sent to {Phone}", phone);
             }
         }
 
@@ -129,7 +164,7 @@ namespace crud_app_backend.Bot.Services
             var binResp = await client.GetAsync(url, ct);
             binResp.EnsureSuccessStatusCode();
 
-            var mime  = binResp.Content.Headers.ContentType?.MediaType ?? fallbackMime;
+            var mime = binResp.Content.Headers.ContentType?.MediaType ?? fallbackMime;
             var bytes = await binResp.Content.ReadAsByteArrayAsync(ct);
 
             _logger.LogDebug("[Dialog] Downloaded mediaId={Id}: {Bytes}b mime={Mime}",
