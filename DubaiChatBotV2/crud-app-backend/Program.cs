@@ -19,6 +19,7 @@ builder.Services.AddDbContextPool<AppDbContext>(options =>
 builder.Services.AddScoped<IWhatsAppSessionRepository, WhatsAppSessionRepository>();
 builder.Services.AddScoped<IWhatsAppMessageRepository, WhatsAppMessageRepository>();
 builder.Services.AddScoped<IWhatsAppComplaintRepository, WhatsAppComplaintRepository>();
+builder.Services.AddScoped<IBotCatalogRepository, BotCatalogRepository>();
 
 // ── Session service ───────────────────────────────────────────────────────────
 builder.Services.AddScoped<IWhatsAppSessionService, WhatsAppSessionService>();
@@ -27,6 +28,8 @@ builder.Services.AddScoped<IWhatsAppSessionService, WhatsAppSessionService>();
 builder.Services.AddSingleton<BotStateService>();   // per-user locks + burst detection
 builder.Services.AddSingleton<WebhookQueue>();       // Channel for instant 200 OK
 builder.Services.AddScoped<IUaeBotService, UaeBotService>();
+builder.Services.AddScoped<IBotCatalogService, BotCatalogService>();
+
 
 // WhatsApp send/receive provider — "Meta" (direct Cloud API) or "Dialog" (360dialog BSP).
 // Switch back to 360dialog anytime by changing "WhatsAppProvider" in appsettings.json —

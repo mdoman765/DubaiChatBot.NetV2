@@ -12,7 +12,8 @@ namespace crud_app_backend
         public DbSet<WhatsAppSessionHistory> WhatsAppSessionHistories { get; set; } = null!;
         public DbSet<WhatsAppMessage> WhatsAppMessages { get; set; } = null!;
         public DbSet<WhatsAppComplaint> WhatsAppComplaints { get; set; } = null!;
-
+        public DbSet<Models.BotCatalogProduct> BotCatalogProducts { get; set; } = null!;
+        public DbSet<Models.BotCatalogSettings> BotCatalogSettings { get; set; } = null!;
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             // ── dbo.WhatsAppMessages ──────────────────────────────────────────
@@ -87,6 +88,33 @@ namespace crud_app_backend
                 entity.HasIndex(e => e.TicketType)
                       .HasDatabaseName("IX_WhatsAppComplaints_TicketType");
             });
+
+            // ── dbo.BotCatalogProducts ─────────────────────────────────────────
+            modelBuilder.Entity<Models.BotCatalogProduct>(entity =>
+            {
+                entity.ToTable("BotCatalogProducts", "dbo");
+                entity.HasKey(e => e.Id);
+                entity.Property(e => e.Sku).HasMaxLength(100).IsRequired();
+                entity.Property(e => e.ProductName).HasMaxLength(500).IsRequired();
+                entity.Property(e => e.IsActive).HasDefaultValue(true);
+                entity.Property(e => e.CreatedAt).HasDefaultValueSql("getutcdate()");
+                entity.Property(e => e.UpdatedAt).HasDefaultValueSql("getutcdate()");
+                entity.HasIndex(e => e.Sku).IsUnique()
+                      .HasDatabaseName("BotCatalogProducts_Sku");
+            });
+
+            // ── dbo.BotCatalogSettings ──────────────────────────────────────────
+            modelBuilder.Entity<Models.BotCatalogSettings>(entity =>
+            {
+                entity.ToTable("BotCatalogSettings", "dbo");
+                entity.HasKey(e => e.Id);
+                entity.Property(e => e.CatalogId).HasMaxLength(100).IsRequired();
+                entity.Property(e => e.CatalogPhone).HasMaxLength(30).IsRequired();
+                entity.Property(e => e.ThumbSku).HasMaxLength(100).IsRequired();
+                entity.Property(e => e.UpdatedAt).HasDefaultValueSql("getutcdate()");
+            });
         }
+
+
     }
 }

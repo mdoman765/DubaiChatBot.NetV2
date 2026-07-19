@@ -23,6 +23,7 @@ namespace crud_app_backend.Bot.Services
         private readonly IHttpClientFactory _httpFactory;
         private readonly ILogger<UaeBotService> _logger;
         private readonly IWhatsAppComplaintRepository _complaintRepo;
+        private readonly IBotCatalogService _catalog;
 
         // ── Website base URL (cont_id=3 for UAE) ─────────────────────────────
         private const string WebsiteBaseUrl = "https://myorder.prangroup.com";
@@ -39,7 +40,8 @@ namespace crud_app_backend.Bot.Services
             BotStateService state,
             IHttpClientFactory httpFactory,
             ILogger<UaeBotService> logger,
-            IWhatsAppComplaintRepository complaintRepo)
+            IWhatsAppComplaintRepository complaintRepo,
+            IBotCatalogService catalog)
         {
             _sessionSvc = sessionSvc;
             _msgRepo = msgRepo;
@@ -52,6 +54,7 @@ namespace crud_app_backend.Bot.Services
             _httpFactory = httpFactory;
             _logger = logger;
             _complaintRepo = complaintRepo;
+            _catalog = catalog;
         }
 
 
@@ -174,6 +177,10 @@ namespace crud_app_backend.Bot.Services
         private async Task<string> RouteAsync(UaeSession s, UaeIncomingMessage msg)
         {
             var raw = msg.RawText;
+
+            // ── Cart order from WhatsApp Catalog — handled regardless of session state ──
+            if (msg.MsgType == "order" && msg.CartItems.Count > 0)
+                return await HandleCartOrderAsync(s, msg);
 
             // Global resets
             if (msg.MsgType == "text" &&
@@ -749,6 +756,101 @@ namespace crud_app_backend.Bot.Services
     "अनुरोध पूरा करने के लिए *Y* भेजें या अधिक जानकारी जोड़ने के लिए *फ़ोटो*, *आवाज़* या *टेक्स्ट* भेजें"
 );
         }
+        // ─────────────────────────────────────────────────────────────────────
+        // CART ORDER (inbound webhook type="order" — WhatsApp Catalog)
+        // ─────────────────────────────────────────────────────────────────────
+
+        private async Task<string> HandleCartOrderAsync(UaeSession s, UaeIncomingMessage msg)
+        {
+            _logger.LogInformation(
+                "[UAE] Cart order from {Phone} — {Count} items, catalogId={Cat}",
+                msg.From, msg.CartItems.Count, msg.OrderCatalogId);
+
+            var nameMap = await _catalog.GetAllNamesAsync();
+
+            var itemLines = msg.CartItems
+                .Select(i =>
+                {
+                    var name = nameMap.TryGetValue(i.Sku, out var n) ? n : i.Sku;
+                    return $"• {name} ({i.Sku}) × {i.Qty}" +
+                           (i.Price > 0 ? $" @ {i.Price:F2} {i.Currency}" : "");
+                })
+                .ToList();
+
+            var total = msg.CartItems.Sum(i => i.Price * i.Qty);
+            var currency = msg.CartItems.FirstOrDefault()?.Currency ?? "AED";
+
+            var totalLine = total > 0
+                ? $"\n\n*Total: {total:F2} {currency}*"
+                : string.Empty;
+
+            var description =
+                $"WhatsApp Catalog Order — Shop: {s.ShopName ?? s.ShopCode}\n\n" +
+                string.Join("\n", itemLines) +
+                (total > 0 ? $"\n\nEstimated Total: {total:F2} {currency}" : "") +
+                (string.IsNullOrWhiteSpace(msg.OrderText) ? "" : $"\n\nCustomer note: {msg.OrderText}") +
+                $"\n\nCatalog ID: {msg.OrderCatalogId}";
+
+            var req = new UaeCrmRequest
+            {
+                ShopCode = s.ShopCode ?? "",
+                WhatsappNumber = s.Phone,
+                TicketType = "PLACE_ORDER",
+                Description = description,
+                CartItems = string.Join("|", msg.CartItems.Select(i => $"{i.Sku}:{i.Qty}:{i.Price}")),
+            };
+
+            var result = await _crm.SubmitAsync(req);
+
+            await _complaintRepo.AddAsync(new crud_app_backend.Models.WhatsAppComplaint
+            {
+                Phone = s.Phone,
+                ShopCode = req.ShopCode,
+                ShopName = s.ShopName,
+                TicketType = req.TicketType,
+                TicketCategory = "UAE_Chatbot",
+                Description = req.Description,
+                CartItems = req.CartItems,
+                Status = result.Success ? "SUCCESS" : "FAILED",
+                ExternalTicketId = result.TicketId,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
+            });
+
+            Transition(s, "MAIN_MENU");
+
+            var itemSummary = string.Join("\n", itemLines);
+
+            return result.Success
+                ? s.T(
+                    $"✅ *Order Received!*\n\n" +
+                    $"{itemSummary}{totalLine}\n\n" +
+                    (result.TicketId != null ? $"Ticket ID: *{result.TicketId}*\n\n" : "") +
+                    "Our team will confirm your order shortly.\n\n" +
+                    "👉 Send *menu* for Main Menu",
+
+                    $"✅ *অর্ডার পাওয়া গেছে!*\n\n" +
+                    $"{itemSummary}{totalLine}\n\n" +
+                    (result.TicketId != null ? $"টিকেট আইডি: *{result.TicketId}*\n\n" : "") +
+                    "আমাদের টিম শীঘ্রই আপনার অর্ডার নিশ্চিত করবে।\n\n" +
+                    "👉 *মেনু* — মূল মেনু",
+
+                    $"✅ *ऑर्डर प्राप्त हुआ!*\n\n" +
+                    $"{itemSummary}{totalLine}\n\n" +
+                    (result.TicketId != null ? $"टिकट आईडी: *{result.TicketId}*\n\n" : "") +
+                    "हमारी टीम जल्द ही आपके ऑर्डर की पुष्टि करेगी।\n\n" +
+                    "👉 *मेनू* भेजें मुख्य मेनू के लिए")
+
+                : s.T(
+                    $"❌ *Could not save your order.*\n{result.Error}\n\n" +
+                    "Please try again or send *4* to reach a support agent.",
+                    $"❌ *অর্ডার সেভ করা যায়নি।*\n{result.Error}\n\n" +
+                    "আবার চেষ্টা করুন বা *4* পাঠিয়ে এজেন্টের সাথে যোগাযোগ করুন।",
+                    $"❌ *आपका ऑर्डर सेव नहीं हो सका।*\n{result.Error}\n\n" +
+                    "कृपया पुनः प्रयास करें या सहायता एजेंट से संपर्क करने के लिए *4* भेजें।");
+        }
+
+
 
         private async Task<string> SubmitMediaAsync(UaeSession s, string ticketType)
         {
@@ -1101,6 +1203,9 @@ namespace crud_app_backend.Bot.Services
     // MESSAGE PARSER
     // ─────────────────────────────────────────────────────────────────────────
 
+    /// <summary>One line-item from a WhatsApp catalog cart webhook.</summary>
+    public record CartItem(string Sku, int Qty, decimal Price, string Currency);
+
     public class UaeIncomingMessage
     {
         public string From { get; set; } = "";
@@ -1116,6 +1221,11 @@ namespace crud_app_backend.Bot.Services
         public string ImageCaption { get; set; } = "";
         public string? SavedFileUrl { get; set; }
         public string? SavedFilePath { get; set; }
+
+        // ── Catalog cart order (type = "order") ───────────────────────────────
+        public string OrderCatalogId { get; set; } = "";
+        public string OrderText { get; set; } = "";
+        public List<CartItem> CartItems { get; set; } = new();
     }
 
     public static class UaeMessageParser
@@ -1189,6 +1299,31 @@ namespace crud_app_backend.Bot.Services
                     imageCap = S(image, "caption");
                 }
 
+                // ── Catalog cart order ────────────────────────────────────────
+                string orderCatalogId = "", orderText = "";
+                var cartItems = new List<CartItem>();
+
+                if (msgType == "order" && msg.TryGetProperty("order", out var order))
+                {
+                    orderCatalogId = S(order, "catalog_id");
+                    orderText = S(order, "text");
+
+                    if (order.TryGetProperty("product_items", out var items) &&
+                        items.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var item in items.EnumerateArray())
+                        {
+                            var sku = S(item, "product_retailer_id");
+                            var qty = item.TryGetProperty("quantity", out var qEl) ? qEl.GetInt32() : 1;
+                            var price = item.TryGetProperty("item_price", out var pEl) ? pEl.GetDecimal() : 0m;
+                            var currency = S(item, "currency");
+
+                            if (!string.IsNullOrEmpty(sku))
+                                cartItems.Add(new CartItem(sku, qty, price, currency));
+                        }
+                    }
+                }
+
                 return new UaeIncomingMessage
                 {
                     From = from,
@@ -1202,6 +1337,9 @@ namespace crud_app_backend.Bot.Services
                     ImageId = imageId,
                     ImageMime = imageMime,
                     ImageCaption = imageCap,
+                    OrderCatalogId = orderCatalogId,
+                    OrderText = orderText,
+                    CartItems = cartItems,
                 };
             }
             catch { return null; }
