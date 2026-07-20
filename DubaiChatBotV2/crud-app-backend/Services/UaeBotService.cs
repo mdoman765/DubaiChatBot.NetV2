@@ -201,8 +201,39 @@ namespace crud_app_backend.Bot.Services
             // unverified shops later.
             if (s.State == "INIT")
             {
+                string customerName;
+
+                // ── Bare 6-character QR code (e.g. "2YU9Y7") — scanned via QR ──────
+                var qrCode = ExtractQrCode(msg.RawTextOriginal);
+                if (qrCode != null)
+                {
+                    var qr = await CheckQrCodeAsync(qrCode);
+                    customerName = msg.SenderName;
+
+                    if (qr != null)
+                    {
+                        s.ShopVerified = true;
+                        s.ShopCode = qr.Value.SiteCode;   // site_code from API — the real shop code
+                        s.ShopName = qr.Value.SiteName;
+                        s.QrCode = qrCode;
+                        customerName = qr.Value.SiteName;
+                    }
+                    else
+                    {
+                        s.ShopVerified = false;
+                        s.QrCode = qrCode;
+                        // ShopCode intentionally left unset — the scanned QR code
+                        // is NOT a shop code, and no site_code exists on failure.
+                    }
+
+                    Transition(s, "AWAITING_LANG");
+                    await SendWelcomeAsync(msg.From, customerName);
+                    return string.Empty;
+                }
+
+                // ── Sentence-style code, e.g. "Hello, I am from X (Code: Y)" ───────
                 var code = ExtractShopCode(raw);
-                var customerName = ExtractCustomerName(raw, msg.SenderName);
+                customerName = ExtractCustomerName(raw, msg.SenderName);
                 var shop = await ValidateShopAsync(code);
 
                 if (shop != null)
@@ -217,9 +248,6 @@ namespace crud_app_backend.Bot.Services
                         ? shop.Value.SiteName
                         : $"{ownerTitleCase} | {shop.Value.SiteName}";
 
-                    // ★ If the message had no "from ... (Code: ...)" name pattern (i.e. user
-                    // just sent a bare code), prefer the verified shop owner's name over
-                    // the raw WhatsApp profile name for the greeting.
                     var nameWasInMessage = System.Text.RegularExpressions.Regex.IsMatch(
                         raw, @"from\s+(.+?)\s*\(?\s*code",
                         System.Text.RegularExpressions.RegexOptions.IgnoreCase);
@@ -291,6 +319,20 @@ namespace crud_app_backend.Bot.Services
         /// Falls back to the raw trimmed text if no "Code:" / numeric pattern
         /// is found, preserving old behaviour for plain code entries.
         /// </summary>
+        /// <summary>
+        /// Detects a bare 6-character alphanumeric QR code (e.g. "2YU9Y7"),
+        /// distinct from the longer "Hello, I am from X (Code: Y)" sentence
+        /// pattern handled by ExtractShopCode. Uppercased since the QR-check
+        /// API expects/returns uppercase codes.
+        /// </summary>
+        private static string? ExtractQrCode(string rawTextOriginal)
+        {
+            var trimmed = (rawTextOriginal ?? "").Trim();
+            return System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^[A-Za-z0-9]{6}$")
+                ? trimmed.ToUpperInvariant()
+                : null;
+        }
+
         private static string ExtractShopCode(string rawText)
         {
             if (string.IsNullOrWhiteSpace(rawText)) return rawText?.Trim() ?? "";
@@ -431,6 +473,75 @@ namespace crud_app_backend.Bot.Services
             if (string.IsNullOrWhiteSpace(shopName)) return string.Empty;
             var pipeIdx = shopName.IndexOf(" | ", StringComparison.Ordinal);
             return pipeIdx > 0 ? shopName[..pipeIdx].Trim() : string.Empty;
+        }
+
+        /// <summary>
+        /// POST http://spro.prgfms.com/api/v3/siteQrCheck — validates a scanned
+        /// QR code and returns the matching shop's site_code/site_name.
+        /// Reuses the same ApiKey/base URL already configured for GetSrAgentsAsync
+        /// (Spror:AgentApiKey / Spror:AgentBaseUrl).
+        /// </summary>
+        private async Task<(string SiteCode, string SiteName)?> CheckQrCodeAsync(string qrCode)
+        {
+            try
+            {
+                var apiKey = _config["Spror:AgentApiKey"] ?? "f06ff43be3310989";
+                var baseUrl = (_config["Spror:AgentBaseUrl"] ?? "http://spro.prgfms.com").TrimEnd('/');
+                var countryId = _config["Spror:QrCountryId"] ?? "3";
+
+                var client = _httpFactory.CreateClient("Spror");
+                client.Timeout = TimeSpan.FromSeconds(15);
+
+                // The "Spror" named client attaches a default Bearer Authorization
+                // header (Spror:BearerToken) for other endpoints. siteQrCheck only
+                // accepts the ApiKey header and rejects requests carrying that
+                // extra Authorization header with a 401 — so strip it here.
+                client.DefaultRequestHeaders.Remove("Authorization");
+
+                // Body: country_id, qr_code (form-urlencoded, per API spec)
+                var request = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/api/v3/siteQrCheck")
+                {
+                    Content = new FormUrlEncodedContent(new Dictionary<string, string>
+                    {
+                        ["country_id"] = countryId,
+                        ["qr_code"] = qrCode
+                    })
+                };
+                request.Headers.TryAddWithoutValidation("ApiKey", apiKey);
+
+                _logger.LogInformation("[UAE] CheckQrCode qr={Qr} countryId={Cid}", qrCode, countryId);
+                var resp = await client.SendAsync(request);
+
+                var json = await resp.Content.ReadAsStringAsync();
+                _logger.LogInformation("[UAE] CheckQrCode {Code} response: {J}",
+                    (int)resp.StatusCode, json.Length > 400 ? json[..400] : json);
+
+                if (!resp.IsSuccessStatusCode) return null;
+
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+
+                var status = root.TryGetProperty("status", out var stEl) ? stEl.GetString() : null;
+                var isRegistered = root.TryGetProperty("is_registered", out var irEl) &&
+                                    irEl.ValueKind == JsonValueKind.True;
+
+                if (status != "success" || !isRegistered) return null;
+
+                if (!root.TryGetProperty("data", out var dataEl) || dataEl.ValueKind != JsonValueKind.Object)
+                    return null;
+
+                var siteCode = dataEl.TryGetProperty("site_code", out var scEl) ? scEl.GetString() ?? "" : "";
+                var siteName = dataEl.TryGetProperty("site_name", out var snEl) ? snEl.GetString() ?? "" : "";
+
+                if (string.IsNullOrWhiteSpace(siteCode)) return null;
+
+                return (siteCode, siteName);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "[UAE] CheckQrCode failed qr={Qr}", qrCode);
+                return null;
+            }
         }
 
         private async Task<(string SiteName, string Id, string OwnerName)?> ValidateShopAsync(string shopCode)
@@ -1214,6 +1325,7 @@ namespace crud_app_backend.Bot.Services
         public string MsgType { get; set; } = "text";
         public long Timestamp { get; set; }
         public string RawText { get; set; } = "";
+        public string RawTextOriginal { get; set; } = "";
         public string AudioId { get; set; } = "";
         public string AudioMime { get; set; } = "audio/ogg";
         public string ImageId { get; set; } = "";
@@ -1275,13 +1387,15 @@ namespace crud_app_backend.Bot.Services
                 if (string.IsNullOrEmpty(from) || string.IsNullOrEmpty(msgType)) return null;
 
                 string rawText = string.Empty;
+                string rawTextOriginal = string.Empty;
                 if (msgType == "text" &&
                     msg.TryGetProperty("text", out var textEl) &&
                     textEl.TryGetProperty("body", out var bodyEl))
                 {
-                    rawText = System.Text.RegularExpressions.Regex.Replace(
-                        (bodyEl.GetString() ?? "").Trim().ToLowerInvariant(),
+                    rawTextOriginal = System.Text.RegularExpressions.Regex.Replace(
+                        (bodyEl.GetString() ?? "").Trim(),
                         @"[\u200B-\u200D\uFEFF]", "");
+                    rawText = rawTextOriginal.ToLowerInvariant();
                 }
 
                 string audioId = "", audioMime = "audio/ogg";
@@ -1332,6 +1446,7 @@ namespace crud_app_backend.Bot.Services
                     MsgType = msgType,
                     Timestamp = ts,
                     RawText = rawText,
+                    RawTextOriginal = rawTextOriginal,
                     AudioId = audioId,
                     AudioMime = audioMime,
                     ImageId = imageId,
