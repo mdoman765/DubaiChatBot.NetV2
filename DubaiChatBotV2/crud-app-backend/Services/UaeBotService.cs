@@ -683,12 +683,13 @@ namespace crud_app_backend.Bot.Services
 
         /// <summary>
         /// Builds the website order URL reply and transitions back to MAIN_MENU.
-        /// URL pattern: https://myorder.prangroup.com/?cont_id=3&order=1&shopCode={shopCode}
+        /// URL pattern: https://myorder.prangroup.com/?cont_id=3&order=1&shopCode={shopCode}&phone={phone}
         /// </summary>
         private string BuildOrderWebsiteReply(UaeSession s)
         {
             var shopCode = s.ShopCode ?? "";
-            var url = $"{WebsiteBaseUrl}/?cont_id={WebsiteContId}&order=1&shopCode={shopCode}";
+            var phone = s.Phone ?? "";
+            var url = $"{WebsiteBaseUrl}/?cont_id={WebsiteContId}&order=1&shopCode={shopCode}&phone={phone}";
 
             Transition(s, "MAIN_MENU");
 
