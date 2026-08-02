@@ -182,8 +182,12 @@ namespace crud_app_backend.Bot.Services
             if (msg.MsgType == "order" && msg.CartItems.Count > 0)
                 return await HandleCartOrderAsync(s, msg);
 
-            // Global resets
+            // Global resets — only for users who are already past onboarding.
+            // A brand-new (INIT) phone sending "hi"/"hello"/etc. must still
+            // go through QR/Shop Code verification like any other first
+            // message, so this shortcut is skipped while s.State == "INIT".
             if (msg.MsgType == "text" &&
+                s.State != "INIT" &&
                 new[] { "hi", "hello", "start", "hey", "new" }.Contains(raw))
             {
                 ResetSession(s);
@@ -192,78 +196,37 @@ namespace crud_app_backend.Bot.Services
                 return string.Empty;
             }
 
-            // ── INIT: verify shop code BEFORE showing language screen ─────────
-            // The very first inbound message (typically from a QR-code deep link,
-            // e.g. "Hello, I am from Lakshmi Enterprise (Code: 885572322)") is
-            // parsed for a shop code and validated. Regardless of the outcome,
-            // we always proceed to the language screen — but flag verification
-            // status on the session so the main menu can hide Order/Return for
-            // unverified shops later.
+            // ── Global QR re-verification — works from ANY state, as long as
+            //    this phone hasn't verified a shop yet. Lets a user who never
+            //    completed verification (skipped/failed at INIT, or started
+            //    with a random message) scan/send a QR code later in the
+            //    conversation to link their shop at that point. ─────────────
+            if (!s.ShopVerified && msg.MsgType == "text")
+            {
+                var qrResult = await TryHandleQrCodeAsync(s, msg);
+                if (qrResult != null) return qrResult;
+            }
+
+            // ── INIT: two ways a user can start a conversation ─────────────────
+            // 1) QR code — a bare 6-character code (min. 2 letters + 4 digits,
+            //    e.g. "AB1234") scanned via QR. Caught by the global QR check
+            //    above (which also covers INIT, since a brand-new phone is
+            //    always unverified) — verified, then goes to language screen.
+            // 2) Random first message — the user is asked to type their Shop
+            //    Code (state AWAITING_SHOP_CODE below). Once they reply, it's
+            //    verified against the shopDetails API, then we go to the same
+            //    language screen. Either path ends at the language screen —
+            //    verification status is flagged on the session so the main
+            //    menu can hide Order/Return for unverified shops later.
             if (s.State == "INIT")
             {
-                string customerName;
-
-                // ── Bare 6-character QR code (e.g. "2YU9Y7") — scanned via QR ──────
-                var qrCode = ExtractQrCode(msg.RawTextOriginal);
-                if (qrCode != null)
-                {
-                    var qr = await CheckQrCodeAsync(qrCode);
-                    customerName = msg.SenderName;
-
-                    if (qr != null)
-                    {
-                        s.ShopVerified = true;
-                        s.ShopCode = qr.Value.SiteCode;   // site_code from API — the real shop code
-                        s.ShopName = qr.Value.SiteName;
-                        s.QrCode = qrCode;
-                        customerName = qr.Value.SiteName;
-                    }
-                    else
-                    {
-                        s.ShopVerified = false;
-                        s.QrCode = qrCode;
-                        // ShopCode intentionally left unset — the scanned QR code
-                        // is NOT a shop code, and no site_code exists on failure.
-                    }
-
-                    Transition(s, "AWAITING_LANG");
-                    await SendWelcomeAsync(msg.From, customerName);
-                    return string.Empty;
-                }
-
-                // ── Sentence-style code, e.g. "Hello, I am from X (Code: Y)" ───────
-                var code = ExtractShopCode(raw);
-                customerName = ExtractCustomerName(raw, msg.SenderName);
-                var shop = await ValidateShopAsync(code);
-
-                if (shop != null)
-                {
-                    s.ShopVerified = true;
-                    s.ShopCode = code;
-                    s.ShopUserId = shop.Value.Id;
-
-                    var ownerTitleCase = System.Globalization.CultureInfo.InvariantCulture
-                        .TextInfo.ToTitleCase((shop.Value.OwnerName ?? "").ToLowerInvariant()).Trim();
-                    s.ShopName = string.IsNullOrWhiteSpace(ownerTitleCase)
-                        ? shop.Value.SiteName
-                        : $"{ownerTitleCase} | {shop.Value.SiteName}";
-
-                    var nameWasInMessage = System.Text.RegularExpressions.Regex.IsMatch(
-                        raw, @"from\s+(.+?)\s*\(?\s*code",
-                        System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
-                    if (!nameWasInMessage && !string.IsNullOrWhiteSpace(ownerTitleCase))
-                        customerName = ownerTitleCase;
-                }
-                else
-                {
-                    s.ShopVerified = false;
-                    s.ShopCode = code;
-                }
-
-                Transition(s, "AWAITING_LANG");
-                await SendWelcomeAsync(msg.From, customerName);
-                return string.Empty;
+                // Not a QR code (already checked above) — ask the user to
+                // enter their Shop Code, then verify it in AWAITING_SHOP_CODE.
+                Transition(s, "AWAITING_SHOP_CODE");
+                return s.T(
+                    "👋 Welcome! Please enter your *Shop Code* to continue.\nExample: *12345678*",
+                    "👋 স্বাগতম! চালিয়ে যেতে আপনার *শপ কোড* লিখুন।\nউদাহরণ: *12345678*",
+                    "👋 स्वागत है! जारी रखने के लिए अपना *शॉप कोड* दर्ज करें।\nउदाहरण: *12345678*");
             }
 
             // Global shortcuts (shop-verified users only)
@@ -309,77 +272,86 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // SHOP CODE EXTRACTION (from QR-code deep-link first message)
+        // QR CODE — VERIFY/RE-VERIFY (used at INIT and globally, any state,
+        // as long as the phone is still unverified)
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Extracts a shop code from the first inbound message, which may be a
-        /// free-form deep-link greeting like:
-        /// "Hello, I am from Lakshmi Enterprise (Code: 885572322)"
-        /// Falls back to the raw trimmed text if no "Code:" / numeric pattern
-        /// is found, preserving old behaviour for plain code entries.
+        /// Checks whether the inbound message is a QR code and, if so, verifies
+        /// it and updates the session. Returns null if the message is NOT a QR
+        /// code (caller should keep routing normally). Returns a non-null
+        /// string (possibly empty, since welcome messages are sent directly)
+        /// if the QR code WAS handled — caller should return that immediately.
         /// </summary>
+        private async Task<string?> TryHandleQrCodeAsync(UaeSession s, UaeIncomingMessage msg)
+        {
+            var qrCode = ExtractQrCode(msg.RawTextOriginal);
+            if (qrCode == null) return null;
+
+            var qr = await CheckQrCodeAsync(qrCode);
+            var customerName = msg.SenderName;
+
+            if (qr != null)
+            {
+                s.ShopVerified = true;
+                s.ShopCode = qr.Value.SiteCode;   // site_code from API — the real shop code
+                s.ShopName = qr.Value.SiteName;
+                s.QrCode = qrCode;
+                customerName = qr.Value.SiteName;
+            }
+            else
+            {
+                s.ShopVerified = false;
+                s.QrCode = qrCode;
+                // ShopCode intentionally left unset — the scanned QR code
+                // is NOT a shop code, and no site_code exists on failure.
+            }
+
+            // ── Brand-new conversation (still INIT) — same as before: go
+            //    straight to the language screen. ─────────────────────────
+            if (s.State == "INIT")
+            {
+                Transition(s, "AWAITING_LANG");
+                await SendWelcomeAsync(msg.From, customerName);
+                return string.Empty;
+            }
+
+            // ── Re-scan mid-conversation (any later state) — don't restart
+            //    the whole flow or touch language; just confirm the result
+            //    and drop them back at the main menu. ─────────────────────
+            if (qr != null)
+            {
+                Transition(s, "MAIN_MENU");
+                return s.T(
+                    $"✅ *Shop Verified!*\nYour number is now linked to *{s.ShopName}*.\n\n{BuildMainMenuBody(s.Lang ?? "en", true)}",
+                    $"✅ *শপ যাচাই হয়েছে!*\nআপনার নম্বরটি এখন *{s.ShopName}* এর সাথে যুক্ত।\n\n{BuildMainMenuBody(s.Lang ?? "en", true)}",
+                    $"✅ *दुकान सत्यापित!*\nआपका नंबर अब *{s.ShopName}* से जुड़ा है।\n\n{BuildMainMenuBody(s.Lang ?? "en", true)}");
+            }
+
+            return s.T(
+                $"❌ QR Code *{qrCode}* not recognised.\n\n👉 Try scanning again, or send *S* to talk to a Support Agent.",
+                $"❌ QR কোড *{qrCode}* শনাক্ত হয়নি।\n\n👉 আবার স্ক্যান করুন, বা *S* পাঠিয়ে সাপোর্ট এজেন্টের সাথে কথা বলুন।",
+                $"❌ QR कोड *{qrCode}* पहचाना नहीं गया।\n\n👉 फिर से स्कैन करें, या *S* भेजकर सपोर्ट एजेंट से बात करें।");
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // QR CODE DETECTION (start-path #1)
+        // ─────────────────────────────────────────────────────────────────────
+
         /// <summary>
-        /// Detects a bare 6-character alphanumeric QR code (e.g. "2YU9Y7"),
-        /// distinct from the longer "Hello, I am from X (Code: Y)" sentence
-        /// pattern handled by ExtractShopCode. Uppercased since the QR-check
-        /// API expects/returns uppercase codes.
+        /// Detects a 6-character QR code made of a minimum of 2 letters
+        /// followed by 4 digits (e.g. "AB1234"). Uppercased since the
+        /// QR-check API expects/returns uppercase codes. Any first message
+        /// that does NOT match this pattern is treated as a random message,
+        /// and the user is asked to enter their Shop Code instead.
         /// </summary>
         private static string? ExtractQrCode(string rawTextOriginal)
         {
             var trimmed = (rawTextOriginal ?? "").Trim();
-            return System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^[A-Za-z0-9]{6}$")
+            return System.Text.RegularExpressions.Regex.IsMatch(trimmed, @"^[A-Za-z]{2,}\d{4}$")
+                && trimmed.Length == 6
                 ? trimmed.ToUpperInvariant()
                 : null;
-        }
-
-        private static string ExtractShopCode(string rawText)
-        {
-            if (string.IsNullOrWhiteSpace(rawText)) return rawText?.Trim() ?? "";
-
-            // Matches "code: 123456", "code : 123456", "(code 123456)", "code-123456" etc.
-            var match = System.Text.RegularExpressions.Regex.Match(
-                rawText,
-                @"code\s*[:\-]?\s*(\d{3,})",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
-            if (match.Success)
-                return match.Groups[1].Value.Trim();
-
-            // Fallback: if the text has no "code" keyword but contains a long
-            // numeric run (e.g. user just pastes the number alone), grab it.
-            var numMatch = System.Text.RegularExpressions.Regex.Match(rawText, @"\d{4,}");
-            if (numMatch.Success)
-                return numMatch.Value.Trim();
-
-            // No pattern matched — preserve original behaviour (whole text as code)
-            return rawText.Trim();
-        }
-
-        /// <summary>
-        /// Extracts a display name from the first inbound message, e.g.
-        /// "Hello, I am from Jai Hind Restaurant (Code: 10400691)" → "Jai Hind Restaurant".
-        /// Falls back to the WhatsApp profile name, then empty string.
-        /// </summary>
-        private static string ExtractCustomerName(string rawText, string senderName)
-        {
-            if (!string.IsNullOrWhiteSpace(rawText))
-            {
-                var match = System.Text.RegularExpressions.Regex.Match(
-                    rawText,
-                    @"from\s+(.+?)\s*\(?\s*code",
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
-                if (match.Success)
-                {
-                    var name = match.Groups[1].Value.Trim().Trim('(', ')', '-', ',');
-                    if (!string.IsNullOrWhiteSpace(name))
-                        return System.Globalization.CultureInfo.InvariantCulture
-                            .TextInfo.ToTitleCase(name.ToLowerInvariant());
-                }
-            }
-
-            return string.IsNullOrWhiteSpace(senderName) ? "" : senderName.Trim();
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -419,8 +391,11 @@ namespace crud_app_backend.Bot.Services
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // SHOP AUTHENTICATION (legacy AWAITING_SHOP_CODE state — kept intact
-        // for safety/back-compat, though normal flow now verifies at INIT)
+        // SHOP AUTHENTICATION — start-path #2 (AWAITING_SHOP_CODE state)
+        // Reached when the user's very first message was NOT a QR code; they
+        // were asked to type their Shop Code (see INIT above). On success this
+        // verifies the code against the shopDetails API, then hands off to the
+        // language screen exactly like the QR path does.
         // ─────────────────────────────────────────────────────────────────────
 
         private async Task<string> HandleShopCodeAsync(UaeSession s, UaeIncomingMessage msg)
@@ -450,29 +425,13 @@ namespace crud_app_backend.Bot.Services
                 ? shop.Value.SiteName
                 : $"{ownerTitleCase} | {shop.Value.SiteName}";
 
-            Transition(s, "MAIN_MENU");
+            var customerName = string.IsNullOrWhiteSpace(ownerTitleCase)
+                ? (string.IsNullOrWhiteSpace(msg.SenderName) ? shop.Value.SiteName : msg.SenderName)
+                : ownerTitleCase;
 
-            var displayOwner = ExtractOwnerFromShopName(s.ShopName);
-
-            var greeting = string.IsNullOrWhiteSpace(displayOwner)
-                ? s.T("✅ *Shop Verified! Welcome to*",
-                      "✅ *শপ যাচাই হয়েছে! স্বাগতম*",
-                      "✅ *दुकान सत्यापित! स्वागत है*")
-                : s.T($"✅ *Hi, {displayOwner}!* Welcome to",
-                      $"✅ *হ্যালো, {displayOwner}!* স্বাগতম",
-                      $"✅ *नमस्ते, {displayOwner}!* स्वागत है");
-
-            return s.T(
-                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("en", true)}",
-                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("bn", true)}",
-                $"{greeting}\n*PRAN-RFL UAE Sales Support*\n\n{BuildMainMenuBody("hi", true)}");
-        }
-
-        private static string ExtractOwnerFromShopName(string? shopName)
-        {
-            if (string.IsNullOrWhiteSpace(shopName)) return string.Empty;
-            var pipeIdx = shopName.IndexOf(" | ", StringComparison.Ordinal);
-            return pipeIdx > 0 ? shopName[..pipeIdx].Trim() : string.Empty;
+            Transition(s, "AWAITING_LANG");
+            await SendWelcomeAsync(msg.From, customerName);
+            return string.Empty;
         }
 
         /// <summary>
